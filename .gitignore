@@ -1,0 +1,88 @@
+# OS / editor noise
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Rust
+/target/
+**/*.rs.bk
+
+# Node / frontend toolchains
+node_modules/
+dist/
+.test-dist/
+.workspace-test-dist/
+.next/
+.nuxt/
+.turbo/
+.pnpm-store/
+.npm/
+.yarn/
+.yarn/cache/
+.yarn/unplugged/
+.yarn/install-state.gz
+.yarn/build-state.yml
+coverage/
+
+# Python / scripting caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Env / secrets / local config
+.env
+.env.*
+!.env.example
+!.env.sample
+*.local
+.axiom/
+.axioms/
+
+# Local logs / reports / temp outputs
+logs/
+*.log
+*.out
+*.err
+/tmp/
+/var/
+
+# Generated LLM or evaluation fixtures
+tests/fixtures/llm/
+evals/fixtures/generated/
+
+# Repo-local AI / tool state
+.claude/
+.serena/
+.axiom-sessions/
+.cursor/
+.cache/
+
+# Project runtime system outputs
+project/system/logbook.jsonl
+project/system/logbook.md
+project/system/snapshot.json
+project/system/snapshot.jsonl
+project/system/snapshot.json*
+project/system/ledger/
+project/system/runs/
+project/system/recovery/
+project/system/specpacks/
+
+# Generic runtime / artifact outputs
+artifacts/
+reports/
+recordings/
+screenshots/
+
+# App-specific generated binaries
+packages/apps/axiom/src-tauri/binaries/axiom-cli*
+!packages/apps/axiom/src-tauri/binaries/README.md
