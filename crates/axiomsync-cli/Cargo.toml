@@ -1,0 +1,25 @@
+[package]
+name = "axiomsync-cli"
+version = "1.0.0"
+authors = { workspace = true }
+edition = { workspace = true }
+description = "Command-line interface for AxiomSync data runtime."
+license = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+readme = "README.md"
+exclude = [
+    "../../logs/*",
+    "../../target/*",
+]
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+axiomsync = { version = "1.0.0", path = "../axiomsync", default-features = false, features = ["host-tools", "markdown-preview"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
