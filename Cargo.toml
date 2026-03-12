@@ -1,0 +1,22 @@
+[package]
+name = "axiomnexus"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+members = [".", "crates/axiomnexus-governance"]
+resolver = "2"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "axiomnexus"
+path = "src/main.rs"
+
+[dependencies]
+coclai = "0.3.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+surrealdb = { version = "=3.0.2", default-features = false, features = ["kv-surrealkv"] }
+tokio = { version = "1.48", features = ["rt", "time"] }

@@ -1,0 +1,191 @@
+{
+  "name": "axiomnexus-rust-default",
+  "revision": 1,
+  "status": "active",
+  "rules": [
+    {
+      "kind": "queue",
+      "actor_kind": "board",
+      "from": [
+        "backlog"
+      ],
+      "to": "todo",
+      "lease_effect": "none",
+      "gates": []
+    },
+    {
+      "kind": "claim",
+      "actor_kind": "agent",
+      "from": [
+        "todo"
+      ],
+      "to": "doing",
+      "lease_effect": "acquire",
+      "gates": [
+        {
+          "kind": "NoOpenLease"
+        },
+        {
+          "kind": "AgentIsRunnable"
+        }
+      ]
+    },
+    {
+      "kind": "propose_progress",
+      "actor_kind": "agent",
+      "from": [
+        "doing"
+      ],
+      "to": "doing",
+      "lease_effect": "keep",
+      "gates": [
+        {
+          "kind": "LeasePresent"
+        },
+        {
+          "kind": "LeaseHeldByActor"
+        },
+        {
+          "kind": "ExpectedRevMatchesSnapshot"
+        },
+        {
+          "kind": "SummaryPresent"
+        }
+      ]
+    },
+    {
+      "kind": "complete",
+      "actor_kind": "agent",
+      "from": [
+        "doing"
+      ],
+      "to": "done",
+      "lease_effect": "release",
+      "gates": [
+        {
+          "kind": "LeasePresent"
+        },
+        {
+          "kind": "LeaseHeldByActor"
+        },
+        {
+          "kind": "ExpectedRevMatchesSnapshot"
+        },
+        {
+          "kind": "SummaryPresent"
+        },
+        {
+          "kind": "ChangedFilesObserved"
+        },
+        {
+          "kind": "AllRequiredObligationsResolved"
+        },
+        {
+          "kind": "CommandSucceeds",
+          "argv": [
+            "cargo",
+            "fmt",
+            "--all",
+            "--check"
+          ],
+          "timeout_sec": 180,
+          "allow_exit_codes": [
+            0
+          ]
+        },
+        {
+          "kind": "CommandSucceeds",
+          "argv": [
+            "cargo",
+            "clippy",
+            "--all-targets",
+            "--all-features",
+            "--",
+            "-D",
+            "warnings"
+          ],
+          "timeout_sec": 600,
+          "allow_exit_codes": [
+            0
+          ]
+        },
+        {
+          "kind": "CommandSucceeds",
+          "argv": [
+            "cargo",
+            "test"
+          ],
+          "timeout_sec": 1200,
+          "allow_exit_codes": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "block",
+      "actor_kind": "agent",
+      "from": [
+        "doing"
+      ],
+      "to": "blocked",
+      "lease_effect": "release",
+      "gates": [
+        {
+          "kind": "LeasePresent"
+        },
+        {
+          "kind": "LeaseHeldByActor"
+        },
+        {
+          "kind": "ExpectedRevMatchesSnapshot"
+        },
+        {
+          "kind": "SummaryPresent"
+        },
+        {
+          "kind": "ManualNotePresent"
+        }
+      ]
+    },
+    {
+      "kind": "reopen",
+      "actor_kind": "board",
+      "from": [
+        "blocked",
+        "done"
+      ],
+      "to": "todo",
+      "lease_effect": "none",
+      "gates": []
+    },
+    {
+      "kind": "cancel",
+      "actor_kind": "board",
+      "from": [
+        "backlog",
+        "todo",
+        "doing",
+        "blocked"
+      ],
+      "to": "cancelled",
+      "lease_effect": "release",
+      "gates": []
+    },
+    {
+      "kind": "override_complete",
+      "actor_kind": "board",
+      "from": [
+        "doing",
+        "blocked"
+      ],
+      "to": "done",
+      "lease_effect": "release",
+      "gates": [
+        {
+          "kind": "ManualNotePresent"
+        }
+      ]
+    }
+  ]
+}
