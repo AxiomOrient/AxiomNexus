@@ -1,0 +1,375 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "axiomnexus/execute-turn-output.schema.json",
+  "title": "ExecuteTurnOutcome",
+  "description": "Final runtime turn contract after WorkspacePort removal. Runtime returns a parsed intent plus local observations needed for evidence assembly.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "handle",
+    "result",
+    "resumed",
+    "repair_count",
+    "prompt_envelope",
+    "observations"
+  ],
+  "properties": {
+    "handle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "runtime_session_id"
+      ],
+      "properties": {
+        "runtime_session_id": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "intent",
+        "raw_output",
+        "usage",
+        "invalid_session"
+      ],
+      "properties": {
+        "intent": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "$id": "axiomnexus/transition-intent.schema.json",
+          "title": "TransitionIntent",
+          "description": "Runtime- or operator-submitted transition proposal. Mirrors the runtime-intent subset of the AxiomNexus transition model.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "work_id",
+            "agent_id",
+            "lease_id",
+            "expected_rev",
+            "kind",
+            "patch",
+            "proof_hints"
+          ],
+          "properties": {
+            "work_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "agent_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "lease_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "expected_rev": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "propose_progress",
+                "complete",
+                "block"
+              ]
+            },
+            "patch": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "summary",
+                "resolved_obligations",
+                "declared_risks"
+              ],
+              "properties": {
+                "summary": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 4000
+                },
+                "resolved_obligations": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "maxItems": 64
+                },
+                "declared_risks": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "maxItems": 64
+                }
+              }
+            },
+            "note": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "maxLength": 4000
+            },
+            "proof_hints": {
+              "type": "array",
+              "maxItems": 64,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "kind",
+                  "value"
+                ],
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "summary",
+                      "file",
+                      "command",
+                      "artifact",
+                      "risk"
+                    ]
+                  },
+                  "value": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              }
+            }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "kind": {
+                    "const": "block"
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "note"
+                ],
+                "properties": {
+                  "note": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4000
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "raw_output": {
+          "type": "string",
+          "minLength": 1
+        },
+        "usage": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "input_tokens",
+            "output_tokens",
+            "run_seconds",
+            "estimated_cost_cents"
+          ],
+          "properties": {
+            "input_tokens": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "output_tokens": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "run_seconds": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "estimated_cost_cents": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "invalid_session": {
+          "type": "boolean"
+        }
+      }
+    },
+    "resumed": {
+      "type": "boolean"
+    },
+    "repair_count": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "session_reset_reason": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "agent",
+        "work",
+        "workspace",
+        "runtime",
+        null
+      ]
+    },
+    "prompt_envelope": {
+      "type": "string",
+      "minLength": 1
+    },
+    "observations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "changed_files",
+        "command_results",
+        "artifact_refs"
+      ],
+      "properties": {
+        "changed_files": {
+          "type": "array",
+          "maxItems": 512,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "path",
+              "kind"
+            ],
+            "properties": {
+              "path": {
+                "type": "string",
+                "minLength": 1
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "created",
+                  "modified",
+                  "deleted",
+                  "renamed"
+                ]
+              },
+              "before_digest": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "after_digest": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            }
+          }
+        },
+        "command_results": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "argv",
+              "purpose",
+              "timed_out"
+            ],
+            "properties": {
+              "argv": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "string"
+                }
+              },
+              "purpose": {
+                "type": "string",
+                "enum": [
+                  "agent_action",
+                  "gate_observation"
+                ]
+              },
+              "exit_code": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "stdout": {
+                "type": "string"
+              },
+              "stderr": {
+                "type": "string"
+              },
+              "duration_ms": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "timed_out": {
+                "type": "boolean"
+              }
+            }
+          }
+        },
+        "artifact_refs": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "path",
+              "digest"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "minLength": 1
+              },
+              "path": {
+                "type": "string",
+                "minLength": 1
+              },
+              "digest": {
+                "type": "string",
+                "minLength": 1
+              },
+              "bytes": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 0
+              }
+            }
+          }
+        },
+        "notes": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 8000
+        }
+      }
+    }
+  }
+}

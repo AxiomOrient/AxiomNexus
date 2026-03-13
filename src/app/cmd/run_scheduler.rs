@@ -3,7 +3,6 @@ use serde::Serialize;
 use crate::port::{
     runtime::RuntimePort,
     store::{QueuedRunCandidate, RuntimeStorePort, SchedulerStorePort, StoreError},
-    workspace::WorkspacePort,
 };
 
 use super::{
@@ -26,7 +25,6 @@ pub(crate) struct RunSchedulerAck {
 pub(crate) fn handle_run_scheduler(
     store: &(impl SchedulerStorePort + RuntimeStorePort + crate::port::store::CommandStorePort),
     runtime: &impl RuntimePort,
-    workspace: &impl WorkspacePort,
     cmd: RunSchedulerCmd,
 ) -> Result<RunSchedulerAck, StoreError> {
     store.reap_timed_out_runs(RUN_REAPER_TIMEOUT)?;
@@ -43,7 +41,6 @@ pub(crate) fn handle_run_scheduler(
     let ack = handle_run_turn_once(
         store,
         runtime,
-        workspace,
         RunTurnOnceReq {
             run_id: run_id.clone(),
             cwd: cmd.cwd,
@@ -84,45 +81,12 @@ mod tests {
                 ActivateContractReq, CreateAgentReq, CreateCompanyReq, CreateContractDraftReq,
                 CreateWorkReq, MergeWakeReq, RecordConsumptionReq, SessionKey, StorePort,
             },
-            workspace::{WorkspaceError, WorkspacePort},
         },
     };
 
     use crate::app::cmd::run_turn_once::runtime_lease_id;
 
     use super::{handle_run_scheduler, next_queued_run_id, RunSchedulerCmd};
-
-    #[derive(Default)]
-    struct TestWorkspace;
-
-    impl WorkspacePort for TestWorkspace {
-        fn current_dir(&self) -> Result<String, WorkspaceError> {
-            Ok("/repo".to_owned())
-        }
-
-        fn observe_changed_files(
-            &self,
-            _cwd: &str,
-            _hinted_paths: &[String],
-        ) -> Vec<crate::model::FileChange> {
-            Vec::new()
-        }
-
-        fn run_gate_command(
-            &self,
-            _cwd: &str,
-            argv: &[String],
-            _timeout: std::time::Duration,
-        ) -> crate::model::CommandResult {
-            crate::model::CommandResult {
-                argv: argv.to_vec(),
-                exit_code: 0,
-                stdout: String::new(),
-                stderr: String::new(),
-                failure_detail: None,
-            }
-        }
-    }
 
     #[test]
     fn run_scheduler_consumes_oldest_queued_run_and_saves_session() {
@@ -160,7 +124,6 @@ mod tests {
         let ack = handle_run_scheduler(
             &store,
             &runtime,
-            &TestWorkspace,
             RunSchedulerCmd {
                 cwd: "/repo".to_owned(),
             },
@@ -190,7 +153,6 @@ mod tests {
         let ack = handle_run_scheduler(
             &store,
             &runtime,
-            &TestWorkspace,
             RunSchedulerCmd {
                 cwd: "/repo".to_owned(),
             },
@@ -292,7 +254,6 @@ mod tests {
         let ack = handle_run_scheduler(
             &store,
             &runtime,
-            &TestWorkspace,
             RunSchedulerCmd {
                 cwd: "/repo".to_owned(),
             },
@@ -340,7 +301,6 @@ mod tests {
         let ack = handle_run_scheduler(
             &store,
             &runtime,
-            &TestWorkspace,
             RunSchedulerCmd {
                 cwd: "/repo".to_owned(),
             },
@@ -433,7 +393,6 @@ mod tests {
         let ack = handle_run_scheduler(
             &store,
             &runtime,
-            &TestWorkspace,
             RunSchedulerCmd {
                 cwd: "/repo".to_owned(),
             },

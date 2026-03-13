@@ -4,16 +4,15 @@ use crate::{
     model::{
         AgentStatus, DecisionOutcome, LeaseId, RunId, SessionInvalidationReason, TransitionKind,
     },
-    port::{
-        runtime::RuntimePort,
-        store::{ClaimLeaseReq, QueuedRunCandidate, RuntimeStorePort, StoreError, StoreErrorKind},
-        workspace::WorkspacePort,
+    port::runtime::RuntimePort,
+    port::store::{
+        ClaimLeaseReq, QueuedRunCandidate, RuntimeStorePort, StoreError, StoreErrorKind,
     },
 };
 
 use super::{
     resume_session::{handle_resume_session, ResumeSessionCmd},
-    submit_intent::{collect_decision_evidence, commit_runtime_intent},
+    submit_intent::{collect_runtime_observation_evidence, commit_runtime_intent},
     RUNTIME_RESUME_POLICY,
 };
 
@@ -43,7 +42,6 @@ pub(crate) struct RunTurnOnceResp {
 pub(crate) fn handle_run_turn_once(
     store: &(impl RuntimeStorePort + crate::port::store::CommandStorePort),
     runtime: &impl RuntimePort,
-    workspace: &impl WorkspacePort,
     req: RunTurnOnceReq,
 ) -> Result<RunTurnOnceResp, StoreError> {
     let initial_turn = store.load_runtime_turn(&req.run_id)?;
@@ -71,7 +69,7 @@ pub(crate) fn handle_run_turn_once(
         },
     )?;
     let context = store.load_context(&turn.snapshot.work_id)?;
-    let evidence = collect_decision_evidence(store, workspace, &context, &ack.intent)?;
+    let evidence = collect_runtime_observation_evidence(store, &ack.observations, &ack.intent)?;
     match commit_runtime_intent(store, &context, &ack.intent, evidence.clone()) {
         Ok(commit_ack) => finalize_run_turn(
             store,
@@ -181,84 +179,10 @@ mod tests {
         port::{
             runtime::RuntimeHandle,
             store::{MergeWakeReq, QueuedRunCandidate, StoreErrorKind, StorePort},
-            workspace::{WorkspaceError, WorkspacePort},
         },
     };
 
-    use super::{
-        collect_decision_evidence, handle_run_turn_once, runtime_lease_id, select_runnable_run_id,
-        RunTurnOnceReq,
-    };
-
-    #[derive(Default)]
-    struct TestWorkspace;
-
-    #[derive(Default)]
-    struct NoChangeWorkspace;
-
-    impl WorkspacePort for TestWorkspace {
-        fn current_dir(&self) -> Result<String, WorkspaceError> {
-            Ok("/repo".to_owned())
-        }
-
-        fn observe_changed_files(
-            &self,
-            _cwd: &str,
-            hinted_paths: &[String],
-        ) -> Vec<crate::model::FileChange> {
-            hinted_paths
-                .iter()
-                .map(|path| crate::model::FileChange {
-                    path: path.clone(),
-                    change_kind: crate::model::ChangeKind::Modified,
-                })
-                .collect()
-        }
-
-        fn run_gate_command(
-            &self,
-            _cwd: &str,
-            argv: &[String],
-            _timeout: std::time::Duration,
-        ) -> crate::model::CommandResult {
-            crate::model::CommandResult {
-                argv: argv.to_vec(),
-                exit_code: 0,
-                stdout: "ok".to_owned(),
-                stderr: String::new(),
-                failure_detail: None,
-            }
-        }
-    }
-
-    impl WorkspacePort for NoChangeWorkspace {
-        fn current_dir(&self) -> Result<String, WorkspaceError> {
-            Ok("/repo".to_owned())
-        }
-
-        fn observe_changed_files(
-            &self,
-            _cwd: &str,
-            _hinted_paths: &[String],
-        ) -> Vec<crate::model::FileChange> {
-            Vec::new()
-        }
-
-        fn run_gate_command(
-            &self,
-            _cwd: &str,
-            argv: &[String],
-            _timeout: std::time::Duration,
-        ) -> crate::model::CommandResult {
-            crate::model::CommandResult {
-                argv: argv.to_vec(),
-                exit_code: 0,
-                stdout: "ok".to_owned(),
-                stderr: String::new(),
-                failure_detail: None,
-            }
-        }
-    }
+    use super::{handle_run_turn_once, runtime_lease_id, select_runnable_run_id, RunTurnOnceReq};
 
     #[test]
     fn run_turn_once_response_exposes_work_run_agent_session_and_wake_outcome() {
@@ -291,7 +215,6 @@ mod tests {
         let resp = handle_run_turn_once(
             &store,
             &runtime,
-            &TestWorkspace,
             RunTurnOnceReq {
                 run_id: crate::model::RunId::from("run-2"),
                 cwd: "/repo".to_owned(),
@@ -344,7 +267,6 @@ mod tests {
         let resp = handle_run_turn_once(
             &store,
             &runtime,
-            &TestWorkspace,
             RunTurnOnceReq {
                 run_id: crate::model::RunId::from("run-1"),
                 cwd: "/repo".to_owned(),
@@ -355,6 +277,47 @@ mod tests {
         assert_eq!(resp.work_id, DEMO_DOING_WORK_ID);
         assert_eq!(resp.pending_wake_count, 0);
         assert_eq!(resp.intent_kind, TransitionKind::ProposeProgress);
+    }
+
+    #[test]
+    fn run_turn_once_commits_runtime_observations_without_workspace_port() {
+        let assets = RuntimeAssets::load_from_repo_root(Path::new(env!("CARGO_MANIFEST_DIR")))
+            .expect("assets should load");
+        let runtime = CoclaiRuntime::with_scripted_replies(
+            assets,
+            vec![ScriptedReply {
+                handle: RuntimeHandle {
+                    runtime_session_id: "runtime-cutover".to_owned(),
+                },
+                raw_output: valid_queued_output(),
+                intent: queued_intent(),
+                usage: usage(),
+                invalid_session: false,
+            }],
+        );
+        let store = MemoryStore::demo();
+        store
+            .merge_wake(MergeWakeReq {
+                work_id: WorkId::from(DEMO_TODO_WORK_ID),
+                actor_kind: crate::model::ActorKind::Board,
+                actor_id: crate::model::ActorId::from("board"),
+                source: "manual".to_owned(),
+                reason: "scheduler".to_owned(),
+                obligations: vec!["follow up".to_owned()],
+            })
+            .expect("wake should create queued run");
+
+        let resp = handle_run_turn_once(
+            &store,
+            &runtime,
+            RunTurnOnceReq {
+                run_id: crate::model::RunId::from("run-2"),
+                cwd: "/repo".to_owned(),
+            },
+        )
+        .expect("runtime observations should close the turn without workspace");
+
+        assert_eq!(resp.run_id, "run-2");
     }
 
     #[test]
@@ -378,7 +341,6 @@ mod tests {
         let resp = handle_run_turn_once(
             &store,
             &runtime,
-            &TestWorkspace,
             RunTurnOnceReq {
                 run_id: crate::model::RunId::from("run-1"),
                 cwd: "/repo".to_owned(),
@@ -421,7 +383,6 @@ mod tests {
         let resp = handle_run_turn_once(
             &store,
             &runtime,
-            &TestWorkspace,
             RunTurnOnceReq {
                 run_id: crate::model::RunId::from("run-1"),
                 cwd: "/repo".to_owned(),
@@ -490,8 +451,8 @@ mod tests {
                 handle: RuntimeHandle {
                     runtime_session_id: "runtime-rejected".to_owned(),
                 },
-                raw_output: valid_complete_output(),
-                intent: complete_intent(),
+                raw_output: rejected_complete_output(),
+                intent: rejected_complete_intent(),
                 usage: usage(),
                 invalid_session: false,
             }],
@@ -505,7 +466,6 @@ mod tests {
         let error = handle_run_turn_once(
             &store,
             &runtime,
-            &NoChangeWorkspace,
             RunTurnOnceReq {
                 run_id: crate::model::RunId::from("run-1"),
                 cwd: "/repo".to_owned(),
@@ -554,7 +514,6 @@ mod tests {
         let error = handle_run_turn_once(
             &store,
             &runtime,
-            &TestWorkspace,
             RunTurnOnceReq {
                 run_id: crate::model::RunId::from("run-1"),
                 cwd: "/repo".to_owned(),
@@ -612,7 +571,6 @@ mod tests {
         let resp = handle_run_turn_once(
             &store,
             &runtime,
-            &TestWorkspace,
             RunTurnOnceReq {
                 run_id: crate::model::RunId::from("run-1"),
                 cwd: "/repo".to_owned(),
@@ -675,7 +633,6 @@ mod tests {
         let resp = handle_run_turn_once(
             &store,
             &runtime,
-            &TestWorkspace,
             RunTurnOnceReq {
                 run_id: crate::model::RunId::from("run-1"),
                 cwd: "/repo".to_owned(),
@@ -732,7 +689,6 @@ mod tests {
         let error = handle_run_turn_once(
             &store,
             &runtime,
-            &TestWorkspace,
             RunTurnOnceReq {
                 run_id: crate::model::RunId::from("run-1"),
                 cwd: "/repo".to_owned(),
@@ -810,39 +766,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn run_turn_once_collects_changed_files_and_command_results_in_standard_stage() {
-        let store = MemoryStore::demo();
-        let context = store
-            .load_context(&WorkId::from(DEMO_DOING_WORK_ID))
-            .expect("context should load");
-        let workspace = TestWorkspace;
-        let intent = TransitionIntent {
-            work_id: WorkId::from(DEMO_DOING_WORK_ID),
-            agent_id: crate::model::AgentId::from(DEMO_AGENT_ID),
-            lease_id: LeaseId::from("00000000-0000-4000-8000-000000000013"),
-            expected_rev: context.snapshot.rev,
-            kind: TransitionKind::Complete,
-            patch: WorkPatch {
-                summary: "complete with evidence".to_owned(),
-                resolved_obligations: Vec::new(),
-                declared_risks: Vec::new(),
-            },
-            note: Some("done".to_owned()),
-            proof_hints: vec![crate::model::ProofHint {
-                kind: crate::model::ProofHintKind::File,
-                value: "src/kernel/mod.rs".to_owned(),
-            }],
-        };
-
-        let evidence = collect_decision_evidence(&store, &workspace, &context, &intent)
-            .expect("evidence should collect");
-
-        assert_eq!(evidence.changed_files.len(), 1);
-        assert_eq!(evidence.command_results.len(), 3);
-        assert_eq!(evidence.observed_agent_status, Some(AgentStatus::Active));
-    }
-
     fn queued_intent() -> TransitionIntent {
         TransitionIntent {
             work_id: WorkId::from(DEMO_TODO_WORK_ID),
@@ -896,6 +819,26 @@ mod tests {
             proof_hints: vec![crate::model::ProofHint {
                 kind: crate::model::ProofHintKind::File,
                 value: "src/kernel/mod.rs".to_owned(),
+            }],
+        }
+    }
+
+    fn rejected_complete_intent() -> TransitionIntent {
+        TransitionIntent {
+            work_id: WorkId::from(DEMO_DOING_WORK_ID),
+            agent_id: crate::model::AgentId::from(DEMO_AGENT_ID),
+            lease_id: LeaseId::from("00000000-0000-4000-8000-000000000013"),
+            expected_rev: 1,
+            kind: TransitionKind::Complete,
+            patch: WorkPatch {
+                summary: "complete without file evidence".to_owned(),
+                resolved_obligations: Vec::new(),
+                declared_risks: Vec::new(),
+            },
+            note: Some("done".to_owned()),
+            proof_hints: vec![crate::model::ProofHint {
+                kind: crate::model::ProofHintKind::Summary,
+                value: "complete without file evidence".to_owned(),
             }],
         }
     }
@@ -970,6 +913,24 @@ mod tests {
             },
             "note": "done",
             "proof_hints": [{"kind":"file","value":"src/kernel/mod.rs"}]
+        })
+        .to_string()
+    }
+
+    fn rejected_complete_output() -> String {
+        serde_json::json!({
+            "work_id": DEMO_DOING_WORK_ID,
+            "agent_id": DEMO_AGENT_ID,
+            "lease_id": "00000000-0000-4000-8000-000000000013",
+            "expected_rev": 1,
+            "kind": "complete",
+            "patch": {
+                "summary": "complete without file evidence",
+                "resolved_obligations": [],
+                "declared_risks": []
+            },
+            "note": "done",
+            "proof_hints": [{"kind":"summary","value":"complete without file evidence"}]
         })
         .to_string()
     }

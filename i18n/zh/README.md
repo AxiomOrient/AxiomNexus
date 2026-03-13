@@ -6,8 +6,9 @@ AxiomNexus 是一个基于 Rust 的 IDC control plane，只有在合同和证据
 
 - [根 README](../../README.md)
 - [文档索引](../../docs/00-index.md)
-- [系统设计](../../docs/01-system-design.md)
-- [目标架构](../../docs/05-target-architecture.md)
+- [最终目标](../../docs/01-FINAL-TARGET.md)
+- [蓝图](../../docs/02-BLUEPRINT.md)
+- [领域模型与不变式](../../docs/03-DOMAIN-AND-INVARIANTS.md)
 - [实现计划](../../plans/IMPLEMENTATION-PLAN.md)
 - [任务台账](../../plans/TASKS.md)
 

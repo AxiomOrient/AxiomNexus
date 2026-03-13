@@ -5,12 +5,12 @@ use std::time::Duration;
 use crate::{
     kernel,
     model::{
-        ActorId, ActorKind, DecisionOutcome, EvidenceBundle, EvidenceInline, GateSpec,
-        ProofHintKind, RecordId, TaskSession, TransitionIntent, TransitionRecord,
+        ActorId, ActorKind, DecisionOutcome, EvidenceBundle, EvidenceInline, RecordId, TaskSession,
+        TransitionIntent, TransitionRecord,
     },
     port::{
-        store::{CommandStorePort, CommitDecisionReq, SessionKey, StoreError, StoreErrorKind},
-        workspace::WorkspacePort,
+        runtime::RuntimeObservations,
+        store::{CommandStorePort, CommitDecisionReq, SessionKey, StoreError},
     },
 };
 
@@ -32,12 +32,39 @@ pub(crate) struct SubmitIntentAck {
 
 pub(crate) fn handle_submit_intent(
     store: &impl CommandStorePort,
-    workspace: &impl WorkspacePort,
     cmd: SubmitIntentCmd,
 ) -> Result<SubmitIntentAck, StoreError> {
     let context = store.load_context(&cmd.intent.work_id)?;
-    let evidence = collect_decision_evidence(store, workspace, &context, &cmd.intent)?;
+    let evidence = collect_direct_submit_evidence(store, &cmd.intent)?;
     commit_runtime_intent(store, &context, &cmd.intent, evidence)
+}
+
+pub(crate) fn collect_direct_submit_evidence(
+    store: &impl CommandStorePort,
+    intent: &TransitionIntent,
+) -> Result<EvidenceBundle, StoreError> {
+    let (observed_agent_status, observed_agent_company_id) = observed_agent_facts(store, intent)?;
+    Ok(EvidenceBundle {
+        observed_agent_status,
+        observed_agent_company_id,
+        ..EvidenceBundle::default()
+    })
+}
+
+pub(crate) fn collect_runtime_observation_evidence(
+    store: &impl CommandStorePort,
+    observations: &RuntimeObservations,
+    intent: &TransitionIntent,
+) -> Result<EvidenceBundle, StoreError> {
+    let (observed_agent_status, observed_agent_company_id) = observed_agent_facts(store, intent)?;
+    Ok(EvidenceBundle {
+        changed_files: observations.changed_files.clone(),
+        command_results: observations.command_results.clone(),
+        artifact_refs: observations.artifact_refs.clone(),
+        observed_agent_status,
+        observed_agent_company_id,
+        ..EvidenceBundle::default()
+    })
 }
 
 pub(crate) fn commit_runtime_intent(
@@ -77,60 +104,6 @@ pub(crate) fn commit_runtime_intent(
     })
 }
 
-pub(crate) fn collect_decision_evidence(
-    store: &impl CommandStorePort,
-    workspace: &impl WorkspacePort,
-    context: &crate::port::store::WorkContext,
-    intent: &TransitionIntent,
-) -> Result<EvidenceBundle, StoreError> {
-    let cwd = gate_command_cwd(store, workspace, intent)?;
-    let (observed_agent_status, observed_agent_company_id) = observed_agent_facts(store, intent)?;
-    let hinted_paths = intent
-        .proof_hints
-        .iter()
-        .filter(|hint| hint.kind == ProofHintKind::File)
-        .map(|hint| hint.value.clone())
-        .collect::<Vec<_>>();
-    let changed_files = if hinted_paths.is_empty() {
-        Vec::new()
-    } else {
-        workspace.observe_changed_files(&cwd, &hinted_paths)
-    };
-    let mut evidence = EvidenceBundle {
-        changed_files,
-        observed_agent_status,
-        observed_agent_company_id,
-        ..EvidenceBundle::default()
-    };
-    let command_gates = kernel::command_gate_specs(
-        &context.snapshot,
-        context.lease.as_ref(),
-        &context.contract,
-        intent,
-    );
-
-    if command_gates.is_empty() {
-        return Ok(evidence);
-    }
-
-    for gate in command_gates {
-        let GateSpec::CommandSucceeds {
-            argv, timeout_sec, ..
-        } = gate
-        else {
-            continue;
-        };
-
-        evidence.command_results.push(workspace.run_gate_command(
-            &cwd,
-            &argv,
-            Duration::from_secs(timeout_sec),
-        ));
-    }
-
-    Ok(evidence)
-}
-
 pub(crate) fn observed_agent_facts(
     store: &impl CommandStorePort,
     intent: &TransitionIntent,
@@ -146,25 +119,6 @@ pub(crate) fn observed_agent_facts(
         agent.as_ref().map(|agent| agent.status),
         agent.map(|agent| agent.company_id),
     ))
-}
-
-pub(crate) fn gate_command_cwd(
-    store: &impl CommandStorePort,
-    workspace: &impl WorkspacePort,
-    intent: &TransitionIntent,
-) -> Result<String, StoreError> {
-    let key = SessionKey {
-        agent_id: intent.agent_id.clone(),
-        work_id: intent.work_id.clone(),
-    };
-    if let Some(session) = store.load_session(&key)? {
-        return Ok(session.cwd);
-    }
-
-    workspace.current_dir().map_err(|error| StoreError {
-        kind: StoreErrorKind::Unavailable,
-        message: format!("submit_intent could not resolve current cwd: {error}"),
-    })
 }
 
 fn record_from_decision(
@@ -262,7 +216,7 @@ fn actor_id_for(kind: crate::model::TransitionKind, intent: &TransitionIntent) -
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, path::Path, rc::Rc};
+    use std::path::Path;
 
     use crate::{
         adapter::{
@@ -286,20 +240,18 @@ mod tests {
             resume_session::{handle_resume_session, ResumeSessionCmd},
         },
         model::{
-            workspace_fingerprint, ActorKind, AgentId, ChangeKind, CommandResult, CompanyId,
-            ContractSet, ContractSetId, ContractSetStatus, DecisionOutcome, FileChange, GateSpec,
-            LeaseEffect, LeaseId, Priority, RuntimeKind, SessionId, TaskSession, TransitionIntent,
-            TransitionKind, TransitionRule, WorkId, WorkKind, WorkLease, WorkPatch, WorkSnapshot,
-            WorkStatus,
+            workspace_fingerprint, ActorKind, AgentId, CompanyId, ContractSet, ContractSetId,
+            ContractSetStatus, DecisionOutcome, GateSpec, LeaseEffect, LeaseId, Priority,
+            RuntimeKind, SessionId, TaskSession, TransitionIntent, TransitionKind, TransitionRule,
+            WorkId, WorkKind, WorkLease, WorkPatch, WorkSnapshot, WorkStatus,
         },
         port::{
             runtime::RuntimeHandle,
             store::{SessionKey, StorePort, WorkContext},
-            workspace::{WorkspaceError, WorkspacePort},
         },
     };
 
-    use super::{collect_decision_evidence, handle_submit_intent, SubmitIntentCmd};
+    use super::{handle_submit_intent, SubmitIntentCmd};
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct FlowSummary {
@@ -325,7 +277,6 @@ mod tests {
 
         let ack = handle_submit_intent(
             &store,
-            &TestWorkspace::default(),
             SubmitIntentCmd {
                 intent: TransitionIntent {
                     work_id: WorkId::from(DEMO_DOING_WORK_ID),
@@ -369,13 +320,44 @@ mod tests {
     }
 
     #[test]
+    fn handle_submit_intent_stays_workspace_free_for_direct_path() {
+        let store = MemoryStore::demo();
+        seed_session(&store, Some("accepted earlier"), Some("old gate"));
+
+        let ack = handle_submit_intent(
+            &store,
+            SubmitIntentCmd {
+                intent: TransitionIntent {
+                    work_id: WorkId::from(DEMO_DOING_WORK_ID),
+                    agent_id: AgentId::from(DEMO_AGENT_ID),
+                    lease_id: LeaseId::from(DEMO_LEASE_ID),
+                    expected_rev: 1,
+                    kind: TransitionKind::ProposeProgress,
+                    patch: WorkPatch {
+                        summary: "progress update".to_owned(),
+                        resolved_obligations: Vec::new(),
+                        declared_risks: Vec::new(),
+                    },
+                    note: None,
+                    proof_hints: vec![crate::model::ProofHint {
+                        kind: crate::model::ProofHintKind::Summary,
+                        value: "progress update".to_owned(),
+                    }],
+                },
+            },
+        )
+        .expect("direct submit should no longer need workspace");
+
+        assert_eq!(ack.outcome, crate::model::DecisionOutcome::Accepted);
+    }
+
+    #[test]
     fn rejected_submit_intent_updates_session_gate_summary() {
         let store = MemoryStore::demo();
         seed_session(&store, Some("accepted earlier"), None);
 
         let ack = handle_submit_intent(
             &store,
-            &TestWorkspace::default(),
             SubmitIntentCmd {
                 intent: TransitionIntent {
                     work_id: WorkId::from(DEMO_DOING_WORK_ID),
@@ -419,137 +401,6 @@ mod tests {
             .after_commit_event_data
             .contains("\"summary\":\"manual transition requires note\""));
         assert!(session.last_record_id.is_some());
-    }
-
-    #[test]
-    fn collect_decision_evidence_executes_allowed_command_gate_and_tracks_changed_files() {
-        let store = MemoryStore::demo();
-        seed_session_at_cwd(&store, Some("accepted earlier"), None, "/repo");
-        let intent = complete_intent_with_file_hint("tracked.txt");
-        let context = complete_context(GateSpec::CommandSucceeds {
-            argv: vec!["cargo".to_owned(), "--version".to_owned()],
-            timeout_sec: 30,
-            allow_exit_codes: vec![0],
-        });
-        let workspace = TestWorkspace {
-            changed_files: vec![FileChange {
-                path: "tracked.txt".to_owned(),
-                change_kind: ChangeKind::Modified,
-            }],
-            command_result: CommandResult {
-                argv: vec!["cargo".to_owned(), "--version".to_owned()],
-                exit_code: 0,
-                stdout: "cargo 1.0.0".to_owned(),
-                stderr: String::new(),
-                failure_detail: None,
-            },
-            ..TestWorkspace::default()
-        };
-
-        let evidence = collect_decision_evidence(&store, &workspace, &context, &intent)
-            .expect("evidence should collect");
-
-        assert_eq!(evidence.changed_files.len(), 1);
-        assert_eq!(evidence.changed_files[0].path, "tracked.txt");
-        assert_eq!(evidence.command_results.len(), 1);
-        assert_eq!(evidence.command_results[0].exit_code, 0);
-        assert!(evidence.command_results[0].failure_detail.is_none());
-        assert!(evidence.command_results[0].stdout.contains("cargo"));
-    }
-
-    #[test]
-    fn collect_decision_evidence_marks_disallowed_command_gate_failure() {
-        let store = MemoryStore::demo();
-        seed_session_at_cwd(&store, Some("accepted earlier"), None, "/repo");
-        let intent = complete_intent_with_file_hint("tracked.txt");
-        let context = complete_context(GateSpec::CommandSucceeds {
-            argv: vec!["echo".to_owned(), "nope".to_owned()],
-            timeout_sec: 30,
-            allow_exit_codes: vec![0],
-        });
-        let workspace = TestWorkspace {
-            changed_files: vec![FileChange {
-                path: "tracked.txt".to_owned(),
-                change_kind: ChangeKind::Modified,
-            }],
-            command_result: CommandResult {
-                argv: vec!["echo".to_owned(), "nope".to_owned()],
-                exit_code: -1,
-                stdout: String::new(),
-                stderr: String::new(),
-                failure_detail: Some("command argv is not in the allowlist".to_owned()),
-            },
-            ..TestWorkspace::default()
-        };
-
-        let evidence = collect_decision_evidence(&store, &workspace, &context, &intent)
-            .expect("evidence should collect");
-
-        assert_eq!(evidence.command_results.len(), 1);
-        assert_eq!(evidence.command_results[0].exit_code, -1);
-        assert!(evidence.command_results[0]
-            .failure_detail
-            .as_deref()
-            .is_some_and(|detail| detail.contains("allowlist")));
-    }
-
-    #[test]
-    fn collect_decision_evidence_ignores_unobserved_file_hints() {
-        let store = MemoryStore::demo();
-        seed_session_at_cwd(&store, Some("accepted earlier"), None, "/repo");
-        let intent = complete_intent_with_file_hint("not-changed.txt");
-        let context = complete_context(GateSpec::ChangedFilesObserved);
-
-        let evidence = collect_decision_evidence(
-            &store,
-            &TestWorkspace {
-                changed_files: vec![FileChange {
-                    path: "tracked.txt".to_owned(),
-                    change_kind: ChangeKind::Modified,
-                }],
-                ..TestWorkspace::default()
-            },
-            &context,
-            &intent,
-        )
-        .expect("evidence should collect");
-
-        assert!(evidence.changed_files.is_empty());
-    }
-
-    #[test]
-    fn collect_decision_evidence_skips_workspace_io_without_required_subset() {
-        let store = MemoryStore::demo();
-        seed_session_at_cwd(&store, Some("accepted earlier"), None, "/repo");
-        let workspace = TestWorkspace::default();
-        let observe_calls = workspace.observe_changed_files_calls.clone();
-        let command_calls = workspace.run_gate_command_calls.clone();
-        let context = progress_context_without_workspace_gates();
-        let intent = TransitionIntent {
-            work_id: WorkId::from(DEMO_DOING_WORK_ID),
-            agent_id: AgentId::from(DEMO_AGENT_ID),
-            lease_id: LeaseId::from(DEMO_LEASE_ID),
-            expected_rev: 1,
-            kind: TransitionKind::ProposeProgress,
-            patch: WorkPatch {
-                summary: "progress only".to_owned(),
-                resolved_obligations: Vec::new(),
-                declared_risks: Vec::new(),
-            },
-            note: None,
-            proof_hints: vec![crate::model::ProofHint {
-                kind: crate::model::ProofHintKind::Summary,
-                value: "progress only".to_owned(),
-            }],
-        };
-
-        let evidence = collect_decision_evidence(&store, &workspace, &context, &intent)
-            .expect("evidence should collect");
-
-        assert!(evidence.changed_files.is_empty());
-        assert!(evidence.command_results.is_empty());
-        assert_eq!(observe_calls.get(), 0);
-        assert_eq!(command_calls.get(), 0);
     }
 
     #[test]
@@ -633,64 +484,6 @@ mod tests {
         );
 
         assert_eq!(memory_summary, surreal_summary);
-    }
-
-    #[derive(Debug, Clone)]
-    struct TestWorkspace {
-        current_dir: String,
-        changed_files: Vec<FileChange>,
-        command_result: CommandResult,
-        observe_changed_files_calls: Rc<Cell<u32>>,
-        run_gate_command_calls: Rc<Cell<u32>>,
-    }
-
-    impl Default for TestWorkspace {
-        fn default() -> Self {
-            Self {
-                current_dir: String::new(),
-                changed_files: Vec::new(),
-                command_result: CommandResult {
-                    argv: Vec::new(),
-                    exit_code: 0,
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    failure_detail: None,
-                },
-                observe_changed_files_calls: Rc::new(Cell::new(0)),
-                run_gate_command_calls: Rc::new(Cell::new(0)),
-            }
-        }
-    }
-
-    impl WorkspacePort for TestWorkspace {
-        fn current_dir(&self) -> Result<String, WorkspaceError> {
-            if self.current_dir.is_empty() {
-                return Ok("/repo".to_owned());
-            }
-
-            Ok(self.current_dir.clone())
-        }
-
-        fn observe_changed_files(&self, _cwd: &str, hinted_paths: &[String]) -> Vec<FileChange> {
-            self.observe_changed_files_calls
-                .set(self.observe_changed_files_calls.get() + 1);
-            self.changed_files
-                .iter()
-                .filter(|change| hinted_paths.iter().any(|path| path == &change.path))
-                .cloned()
-                .collect()
-        }
-
-        fn run_gate_command(
-            &self,
-            _cwd: &str,
-            _argv: &[String],
-            _timeout: std::time::Duration,
-        ) -> CommandResult {
-            self.run_gate_command_calls
-                .set(self.run_gate_command_calls.get() + 1);
-            self.command_result.clone()
-        }
     }
 
     fn seed_session(store: &MemoryStore, decision: Option<&str>, gate: Option<&str>) {
@@ -866,7 +659,6 @@ mod tests {
     ) -> FlowSummary {
         let queued = handle_submit_intent(
             store,
-            &TestWorkspace::default(),
             SubmitIntentCmd {
                 intent: TransitionIntent {
                     work_id: work_id.clone(),
@@ -922,7 +714,6 @@ mod tests {
 
         let committed = handle_submit_intent(
             store,
-            &TestWorkspace::default(),
             SubmitIntentCmd {
                 intent: runtime_intent(work_id, agent_id, &lease.lease_id, context.snapshot.rev),
             },

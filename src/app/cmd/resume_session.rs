@@ -3,11 +3,11 @@ use serde::Serialize;
 use crate::{
     kernel,
     model::{
-        workspace_fingerprint, BillingKind, RunId, RuntimeKind, SessionId, TaskSession,
-        TransitionIntent, TransitionKind,
+        workspace_fingerprint, ActorKind, BillingKind, GateSpec, RunId, RuntimeKind, SessionId,
+        TaskSession, TransitionIntent, TransitionKind, WorkStatus,
     },
     port::{
-        runtime::{ExecuteTurnReq, RuntimePort},
+        runtime::{ExecuteTurnReq, GateCommandSpec, RuntimeObservations, RuntimePort},
         store::{
             RecordConsumptionReq, RuntimeStorePort, RuntimeTurnContext, SessionKey, StoreError,
         },
@@ -31,6 +31,8 @@ pub(crate) struct ResumeSessionAck {
     pub(crate) runtime_session_id: String,
     #[serde(skip_serializing)]
     pub(crate) intent: TransitionIntent,
+    #[serde(skip_serializing)]
+    pub(crate) observations: RuntimeObservations,
     pub(crate) intent_kind: TransitionKind,
 }
 
@@ -66,6 +68,7 @@ pub(crate) fn handle_resume_session(
         cwd: cwd.clone(),
         existing_session: resume_session.clone(),
         prompt_input,
+        gate_plan: gate_plan_for(&turn.contract, turn.snapshot.status),
     }) {
         Ok(outcome) => outcome,
         Err(error) => {
@@ -104,6 +107,7 @@ pub(crate) fn handle_resume_session(
         session_reset_reason,
         runtime_session_id: outcome.handle.runtime_session_id,
         intent: outcome.result.intent,
+        observations: outcome.observations,
         intent_kind,
     })
 }
@@ -129,6 +133,31 @@ fn prompt_input_for(
         last_decision_summary: existing_session
             .and_then(|session| session.last_decision_summary.clone()),
     }
+}
+
+fn gate_plan_for(contract: &crate::model::ContractSet, status: WorkStatus) -> Vec<GateCommandSpec> {
+    contract
+        .rules
+        .iter()
+        .filter(|rule| rule.actor_kind == ActorKind::Agent)
+        .filter(|rule| rule.kind.is_runtime_intent())
+        .filter(|rule| rule.from.contains(&status))
+        .flat_map(|rule| {
+            rule.gates.iter().filter_map(|gate| match gate {
+                GateSpec::CommandSucceeds {
+                    argv,
+                    timeout_sec,
+                    allow_exit_codes,
+                } => Some(GateCommandSpec {
+                    applies_to_kind: rule.kind,
+                    argv: argv.clone(),
+                    timeout_sec: *timeout_sec,
+                    allow_exit_codes: allow_exit_codes.clone(),
+                }),
+                _ => None,
+            })
+        })
+        .collect()
 }
 
 fn session_from_turn(

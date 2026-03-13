@@ -1,7 +1,8 @@
 use std::{error::Error, fmt};
 
 use crate::model::{
-    ConsumptionUsage, SessionInvalidationReason, TaskSession, TransitionIntent, WorkSnapshot,
+    CommandResult, ConsumptionUsage, EvidenceRef, FileChange, SessionInvalidationReason,
+    TaskSession, TransitionIntent, TransitionKind, WorkSnapshot,
 };
 
 use crate::port::store::SessionKey;
@@ -25,6 +26,7 @@ pub(crate) struct ExecuteTurnReq {
     pub(crate) cwd: String,
     pub(crate) existing_session: Option<TaskSession>,
     pub(crate) prompt_input: PromptEnvelopeInput,
+    pub(crate) gate_plan: Vec<GateCommandSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +37,23 @@ pub(crate) struct ExecuteTurnOutcome {
     pub(crate) repair_count: u8,
     pub(crate) session_reset_reason: Option<SessionInvalidationReason>,
     pub(crate) prompt_envelope: String,
+    pub(crate) observations: RuntimeObservations,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GateCommandSpec {
+    pub(crate) applies_to_kind: TransitionKind,
+    pub(crate) argv: Vec<String>,
+    pub(crate) timeout_sec: u64,
+    pub(crate) allow_exit_codes: Vec<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct RuntimeObservations {
+    pub(crate) changed_files: Vec<FileChange>,
+    pub(crate) command_results: Vec<CommandResult>,
+    pub(crate) artifact_refs: Vec<EvidenceRef>,
+    pub(crate) notes: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

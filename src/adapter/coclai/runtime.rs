@@ -1,7 +1,10 @@
 use std::{
     cell::RefCell,
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
+    io::Read,
     path::Path,
+    process::{Command, Stdio},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -12,10 +15,13 @@ use coclai::runtime::{Client, ClientError, PromptRunError, RpcError, SessionConf
 use serde_json::Value;
 
 use crate::{
-    model::{ConsumptionUsage, SessionInvalidationReason, TransitionIntent},
+    model::{
+        ChangeKind, CommandResult, ConsumptionUsage, FileChange, ProofHintKind,
+        SessionInvalidationReason, TransitionIntent,
+    },
     port::runtime::{
         ExecuteTurnOutcome, ExecuteTurnReq, PromptEnvelopeInput, RuntimeError, RuntimeErrorKind,
-        RuntimeHandle, RuntimePort, RuntimeResult,
+        RuntimeHandle, RuntimeObservations, RuntimePort, RuntimeResult,
     },
 };
 
@@ -44,6 +50,24 @@ struct LiveClient {
     runtime: tokio::runtime::Runtime,
     client: Client,
 }
+
+const COMMAND_OUTPUT_LIMIT: usize = 4096;
+const COMMAND_TIMEOUT_EXIT_CODE: i32 = 124;
+const COMMAND_FAILURE_EXIT_CODE: i32 = -1;
+const GATE_COMMAND_ALLOWLIST: &[&[&str]] = &[
+    &["cargo", "fmt", "--all", "--check"],
+    &[
+        "cargo",
+        "clippy",
+        "--all-targets",
+        "--all-features",
+        "--",
+        "-D",
+        "warnings",
+    ],
+    &["cargo", "test"],
+    &["cargo", "--version"],
+];
 
 #[derive(Clone)]
 struct PendingTurn {
@@ -180,6 +204,15 @@ impl CoclaiRuntime {
             }
 
             if validate_runtime_output(&result.raw_output, &result.intent).is_ok() {
+                let observations = match &self.backend {
+                    RuntimeBackend::Live(_) => {
+                        collect_observations(&req.cwd, &result.intent, &req.gate_plan)
+                    }
+                    #[cfg(test)]
+                    RuntimeBackend::Scripted(_) => {
+                        scripted_observations(&result.intent, &req.gate_plan)
+                    }
+                };
                 return Ok(ExecuteTurnOutcome {
                     handle,
                     result,
@@ -187,6 +220,7 @@ impl CoclaiRuntime {
                     repair_count,
                     session_reset_reason,
                     prompt_envelope,
+                    observations,
                 });
             }
 
@@ -260,6 +294,229 @@ impl CoclaiRuntime {
             }
         }
     }
+}
+
+#[cfg(test)]
+fn scripted_observations(
+    intent: &TransitionIntent,
+    gate_plan: &[crate::port::runtime::GateCommandSpec],
+) -> RuntimeObservations {
+    RuntimeObservations {
+        changed_files: intent
+            .proof_hints
+            .iter()
+            .filter(|hint| hint.kind == ProofHintKind::File)
+            .map(|hint| FileChange {
+                path: hint.value.clone(),
+                change_kind: ChangeKind::Modified,
+            })
+            .collect(),
+        command_results: gate_plan
+            .iter()
+            .filter(|spec| spec.applies_to_kind == intent.kind)
+            .map(|spec| CommandResult {
+                argv: spec.argv.clone(),
+                exit_code: 0,
+                stdout: "ok".to_owned(),
+                stderr: String::new(),
+                failure_detail: None,
+            })
+            .collect(),
+        artifact_refs: Vec::new(),
+        notes: None,
+    }
+}
+
+fn collect_observations(
+    cwd: &str,
+    intent: &TransitionIntent,
+    gate_plan: &[crate::port::runtime::GateCommandSpec],
+) -> RuntimeObservations {
+    let hinted_paths = intent
+        .proof_hints
+        .iter()
+        .filter(|hint| hint.kind == ProofHintKind::File)
+        .map(|hint| hint.value.trim())
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let command_results = gate_plan
+        .iter()
+        .filter(|spec| spec.applies_to_kind == intent.kind)
+        .map(|spec| run_gate_command(cwd, &spec.argv, Duration::from_secs(spec.timeout_sec)))
+        .collect();
+
+    RuntimeObservations {
+        changed_files: observe_changed_files(cwd, &hinted_paths),
+        command_results,
+        artifact_refs: Vec::new(),
+        notes: None,
+    }
+}
+
+fn observe_changed_files(cwd: &str, hinted_paths: &[String]) -> Vec<FileChange> {
+    let hinted_paths = hinted_paths
+        .iter()
+        .map(|path| path.trim())
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    if hinted_paths.is_empty() {
+        return Vec::new();
+    }
+
+    let output = match Command::new("git")
+        .args(["status", "--short", "--untracked-files=all"])
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        _ => return Vec::new(),
+    };
+
+    let mut observed = Vec::new();
+    let mut seen = BTreeSet::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if let Some(change) = parse_changed_file(line, &hinted_paths) {
+            if seen.insert(change.path.clone()) {
+                observed.push(change);
+            }
+        }
+    }
+
+    observed
+}
+
+fn parse_changed_file(line: &str, hinted_paths: &BTreeSet<String>) -> Option<FileChange> {
+    if line.len() < 4 {
+        return None;
+    }
+
+    let status = &line[..2];
+    let raw_path = line[3..].trim();
+    let path = raw_path.rsplit(" -> ").next().unwrap_or(raw_path).trim();
+    if !hinted_paths.contains(path) {
+        return None;
+    }
+
+    Some(FileChange {
+        path: path.to_owned(),
+        change_kind: change_kind_from_git_status(status),
+    })
+}
+
+fn change_kind_from_git_status(status: &str) -> ChangeKind {
+    if status.contains('D') {
+        ChangeKind::Deleted
+    } else if status.contains('?') || status.contains('A') {
+        ChangeKind::Added
+    } else {
+        ChangeKind::Modified
+    }
+}
+
+fn run_gate_command(cwd: &str, argv: &[String], timeout: Duration) -> CommandResult {
+    if argv.is_empty() {
+        return failed_command_result(argv, "command argv must not be empty");
+    }
+
+    if !command_is_allowed(argv) {
+        return failed_command_result(argv, "command argv is not in the allowlist");
+    }
+
+    let mut child = match Command::new(&argv[0])
+        .args(&argv[1..])
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            return failed_command_result(argv, &format!("command spawn failed: {error}"));
+        }
+    };
+
+    let stdout = child
+        .stdout
+        .take()
+        .expect("spawned command should expose stdout");
+    let stderr = child
+        .stderr
+        .take()
+        .expect("spawned command should expose stderr");
+    let stdout_reader = thread::spawn(move || read_all(stdout));
+    let stderr_reader = thread::spawn(move || read_all(stderr));
+
+    let started_at = Instant::now();
+    let mut exit_code = COMMAND_FAILURE_EXIT_CODE;
+    let mut failure_detail = None;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                exit_code = status.code().unwrap_or(COMMAND_FAILURE_EXIT_CODE);
+                if !status.success() {
+                    failure_detail = Some(format!("command exited with code {exit_code}"));
+                }
+                break;
+            }
+            Ok(None) if started_at.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                exit_code = COMMAND_TIMEOUT_EXIT_CODE;
+                failure_detail = Some(format!("command timed out after {}s", timeout.as_secs()));
+                break;
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                failure_detail = Some(format!("command wait failed: {error}"));
+                break;
+            }
+        }
+    }
+
+    CommandResult {
+        argv: argv.to_vec(),
+        exit_code,
+        stdout: bound_output(&stdout_reader.join().unwrap_or_default()),
+        stderr: bound_output(&stderr_reader.join().unwrap_or_default()),
+        failure_detail,
+    }
+}
+
+fn failed_command_result(argv: &[String], detail: &str) -> CommandResult {
+    CommandResult {
+        argv: argv.to_vec(),
+        exit_code: COMMAND_FAILURE_EXIT_CODE,
+        stdout: String::new(),
+        stderr: String::new(),
+        failure_detail: Some(detail.to_owned()),
+    }
+}
+
+fn command_is_allowed(argv: &[String]) -> bool {
+    GATE_COMMAND_ALLOWLIST
+        .iter()
+        .any(|allowed| argv.iter().map(String::as_str).eq(allowed.iter().copied()))
+}
+
+fn read_all<R: Read>(mut reader: R) -> Vec<u8> {
+    let mut buffer = Vec::new();
+    let _ = reader.read_to_end(&mut buffer);
+    buffer
+}
+
+fn bound_output(bytes: &[u8]) -> String {
+    let bounded = if bytes.len() > COMMAND_OUTPUT_LIMIT {
+        &bytes[..COMMAND_OUTPUT_LIMIT]
+    } else {
+        bytes
+    };
+    String::from_utf8_lossy(bounded).into_owned()
 }
 
 impl RuntimePort for CoclaiRuntime {
@@ -549,11 +806,12 @@ fn is_invalid_session_rpc(error: &RpcError) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path, time::SystemTime};
+    use std::{env, fs, path::Path, process::Command, time::SystemTime};
 
     use crate::{
         adapter::coclai::assets::{
-            AGENTS_ASSET_PATH, TRANSITION_EXECUTOR_SKILL_PATH, TRANSITION_INTENT_SCHEMA_PATH,
+            AGENTS_ASSET_PATH, EXECUTE_TURN_OUTPUT_SCHEMA_PATH, TRANSITION_EXECUTOR_SKILL_PATH,
+            TRANSITION_INTENT_SCHEMA_PATH,
         },
         model::{
             workspace_fingerprint, AgentId, CompanyId, ConsumptionUsage, ContractSetId, LeaseId,
@@ -562,7 +820,7 @@ mod tests {
             WorkStatus,
         },
         port::{
-            runtime::{ExecuteTurnReq, PromptEnvelopeInput, RuntimePort},
+            runtime::{ExecuteTurnReq, GateCommandSpec, PromptEnvelopeInput, RuntimePort},
             store::SessionKey,
         },
     };
@@ -593,6 +851,11 @@ mod tests {
             runtime.assets.transition_intent_schema,
             fs::read_to_string(repo_root.join(TRANSITION_INTENT_SCHEMA_PATH))
                 .expect("schema asset should load")
+        );
+        assert_eq!(
+            runtime.assets.execute_turn_output_schema,
+            fs::read_to_string(repo_root.join(EXECUTE_TURN_OUTPUT_SCHEMA_PATH))
+                .expect("execute turn schema asset should load")
         );
     }
 
@@ -721,6 +984,95 @@ mod tests {
         assert_eq!(outcome.result.intent.kind, TransitionKind::ProposeProgress);
     }
 
+    #[test]
+    fn execute_turn_collects_changed_files_and_command_results() {
+        let repo = temp_git_repo("coclai-observations");
+        let assets = RuntimeAssets::load_from_repo_root(Path::new(env!("CARGO_MANIFEST_DIR")))
+            .expect("assets should load");
+        let runtime = CoclaiRuntime::with_scripted_replies(
+            assets,
+            vec![ScriptedReply {
+                handle: handle("runtime-observe"),
+                raw_output: format!(
+                    "{{\"work_id\":\"{WORK_ID}\",\"agent_id\":\"{AGENT_ID}\",\"lease_id\":\"{LEASE_ID}\",\"expected_rev\":9,\"kind\":\"propose_progress\",\"patch\":{{\"summary\":\"summary\",\"resolved_obligations\":[\"repair invalid json\"],\"declared_risks\":[]}},\"proof_hints\":[{{\"kind\":\"summary\",\"value\":\"summary\"}},{{\"kind\":\"file\",\"value\":\"tracked.txt\"}}]}}"
+                ),
+                intent: intent_with_hints(
+                    TransitionKind::ProposeProgress,
+                    None,
+                    vec![crate::model::ProofHint {
+                        kind: crate::model::ProofHintKind::File,
+                        value: "tracked.txt".to_owned(),
+                    }],
+                ),
+                usage: usage(),
+                invalid_session: false,
+            }],
+        );
+
+        let outcome = runtime
+            .execute_turn(execute_turn_req_with(
+                None,
+                repo.display().to_string(),
+                vec![GateCommandSpec {
+                    applies_to_kind: TransitionKind::ProposeProgress,
+                    argv: vec!["cargo".to_owned(), "--version".to_owned()],
+                    timeout_sec: 5,
+                    allow_exit_codes: vec![0],
+                }],
+            ))
+            .expect("observation collection should succeed");
+
+        assert_eq!(outcome.observations.changed_files.len(), 1);
+        assert_eq!(outcome.observations.changed_files[0].path, "tracked.txt");
+        assert_eq!(outcome.observations.command_results.len(), 1);
+        assert_eq!(outcome.observations.command_results[0].exit_code, 0);
+    }
+
+    #[test]
+    fn execute_turn_preserves_invalid_session_repair_after_observation_expansion() {
+        let assets = RuntimeAssets::load_from_repo_root(Path::new(env!("CARGO_MANIFEST_DIR")))
+            .expect("assets should load");
+        let runtime = CoclaiRuntime::with_scripted_replies(
+            assets,
+            vec![
+                ScriptedReply {
+                    handle: handle("runtime-old"),
+                    raw_output: valid_output("complete", Some("fixed"), true),
+                    intent: intent(TransitionKind::Complete, Some("fixed".to_owned())),
+                    usage: usage(),
+                    invalid_session: true,
+                },
+                ScriptedReply {
+                    handle: handle("runtime-new"),
+                    raw_output: valid_output("complete", Some("fixed"), true),
+                    intent: intent(TransitionKind::Complete, Some("fixed".to_owned())),
+                    usage: usage(),
+                    invalid_session: false,
+                },
+            ],
+        );
+
+        let outcome = runtime
+            .execute_turn(execute_turn_req_with(
+                Some(session(env!("CARGO_MANIFEST_DIR"))),
+                env!("CARGO_MANIFEST_DIR").to_owned(),
+                vec![GateCommandSpec {
+                    applies_to_kind: TransitionKind::Complete,
+                    argv: vec!["cargo".to_owned(), "--version".to_owned()],
+                    timeout_sec: 5,
+                    allow_exit_codes: vec![0],
+                }],
+            ))
+            .expect("repair after invalid session should still collect observations");
+
+        assert!(!outcome.resumed);
+        assert_eq!(
+            outcome.session_reset_reason,
+            Some(SessionInvalidationReason::Runtime)
+        );
+        assert_eq!(outcome.observations.command_results.len(), 1);
+    }
+
     fn scripted_invalid_reply(session_id: &str) -> ScriptedReply {
         ScriptedReply {
             handle: handle(session_id),
@@ -741,14 +1093,23 @@ mod tests {
     }
 
     fn execute_turn_req(existing_session: Option<TaskSession>) -> ExecuteTurnReq {
+        execute_turn_req_with(existing_session, "/repo".to_owned(), Vec::new())
+    }
+
+    fn execute_turn_req_with(
+        existing_session: Option<TaskSession>,
+        cwd: String,
+        gate_plan: Vec<GateCommandSpec>,
+    ) -> ExecuteTurnReq {
         ExecuteTurnReq {
             session_key: SessionKey {
                 agent_id: AgentId::from(AGENT_ID),
                 work_id: WorkId::from(WORK_ID),
             },
-            cwd: "/repo".to_owned(),
+            cwd,
             existing_session,
             prompt_input: prompt_input(),
+            gate_plan,
         }
     }
 
@@ -803,6 +1164,21 @@ mod tests {
     }
 
     fn intent(kind: TransitionKind, note: Option<String>) -> TransitionIntent {
+        intent_with_hints(kind, note, Vec::new())
+    }
+
+    fn intent_with_hints(
+        kind: TransitionKind,
+        note: Option<String>,
+        mut extra_hints: Vec<crate::model::ProofHint>,
+    ) -> TransitionIntent {
+        extra_hints.insert(
+            0,
+            crate::model::ProofHint {
+                kind: crate::model::ProofHintKind::Summary,
+                value: "summary".to_owned(),
+            },
+        );
         TransitionIntent {
             work_id: WorkId::from(WORK_ID),
             agent_id: AgentId::from(AGENT_ID),
@@ -815,11 +1191,36 @@ mod tests {
                 declared_risks: Vec::new(),
             },
             note,
-            proof_hints: vec![crate::model::ProofHint {
-                kind: crate::model::ProofHintKind::Summary,
-                value: "summary".to_owned(),
-            }],
+            proof_hints: extra_hints,
         }
+    }
+
+    fn temp_git_repo(label: &str) -> std::path::PathBuf {
+        let dir = env::temp_dir().join(format!(
+            "axiomnexus-{label}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should move forward")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("temp dir should exist");
+        run_git(&dir, &["init"]);
+        run_git(&dir, &["config", "user.email", "codex@example.com"]);
+        run_git(&dir, &["config", "user.name", "Codex"]);
+        fs::write(dir.join("tracked.txt"), "first\n").expect("tracked file should write");
+        run_git(&dir, &["add", "tracked.txt"]);
+        run_git(&dir, &["commit", "-m", "init"]);
+        fs::write(dir.join("tracked.txt"), "second\n").expect("tracked file should rewrite");
+        dir
+    }
+
+    fn run_git(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .expect("git command should run");
+        assert!(status.success(), "git {:?} should succeed", args);
     }
 
     fn valid_output(kind: &str, note: Option<&str>, include_patch_arrays: bool) -> String {

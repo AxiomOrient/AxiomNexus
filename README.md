@@ -70,7 +70,8 @@ AXIOMNEXUS_HTTP_ADDR=127.0.0.1:3001 cargo run -- serve
 - repo-wide governance rules: `AGENTS.md`
 - runtime agent prompt policy: `.agents/AGENTS.md`
 - transition executor skill: `.agents/skills/transition-executor/SKILL.md`
-- runtime output schema: `samples/transition-intent.schema.json`
+- runtime intent schema: `samples/transition-intent.schema.json`
+- runtime execute-turn schema: `samples/execute-turn-output.schema.json`
 
 - `AGENTS.md`는 저장소 전반의 작업 규칙과 quality gate를 설명합니다.
 - `.agents/AGENTS.md`와 skill 문서는 runtime agent prompt의 canonical source입니다.
@@ -100,11 +101,13 @@ scripts/verify-runtime.sh
 
 ## 문서
 
-- [문서 인덱스](docs/00-index.md) — 현재 active docs 진입점
-- [시스템 설계](docs/01-system-design.md) — 제품 경계와 핵심 데이터 모델
-- [목표 아키텍처](docs/05-target-architecture.md) — 리뉴얼 후 authoritative technical design
-- [리뉴얼 구현 계획](plans/IMPLEMENTATION-PLAN.md) — 단계별 실행 계획
-- [리뉴얼 태스크 분해](plans/TASKS.md) — stable task ids와 검증 게이트
+- [문서 인덱스](docs/00-index.md) — canonical 읽기 순서
+- [최종 도착지](docs/01-FINAL-TARGET.md) — 범위와 완료 조건
+- [청사진](docs/02-BLUEPRINT.md) — 구조와 제어 흐름
+- [도메인 모델과 불변식](docs/03-DOMAIN-AND-INVARIANTS.md) — 핵심 모델 기준
+- [저장소 계약](docs/spec/STOREPORT-SEMANTIC-CONTRACT.md) — store 의미론 기준
+- [실행 계획](plans/IMPLEMENTATION-PLAN.md) — 현재 미션 계획
+- [태스크 ledger](plans/TASKS.md) — 현재 미션 검증 기록
 
 ## 현재 제한
 

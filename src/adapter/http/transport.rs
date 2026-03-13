@@ -4,7 +4,6 @@ use crate::{
     adapter::{
         memory::store::MemoryStore,
         sse::{after_commit_sse_stream, emit_after_commit, EmittedSseEvent},
-        workspace::SystemWorkspace,
     },
     app::cmd::{
         activate_contract::{handle_activate_contract, ActivateContractCmd},
@@ -160,7 +159,6 @@ const WORK_ROUTES: [&str; 2] = [WORK_COLLECTION_ROUTE, WORK_DETAIL_ROUTE];
 
 pub(crate) struct HttpTransport<S> {
     store: S,
-    workspace: SystemWorkspace,
 }
 
 impl<S> HttpTransport<S>
@@ -168,10 +166,7 @@ where
     S: CommandStorePort + QueryStorePort,
 {
     pub(crate) fn new(store: S) -> Self {
-        Self {
-            store,
-            workspace: SystemWorkspace,
-        }
+        Self { store }
     }
 
     pub(crate) fn handle(&self, req: HttpRequest) -> HttpResponse {
@@ -276,7 +271,7 @@ where
             return bad_request_json(message);
         }
 
-        match handle_submit_intent(&self.store, &self.workspace, SubmitIntentCmd { intent }) {
+        match handle_submit_intent(&self.store, SubmitIntentCmd { intent }) {
             Ok(ack) => accepted_json(&ack, emit_after_commit(ack.after_commit_event_data.clone())),
             Err(error) => store_error_json(error),
         }
@@ -657,7 +652,7 @@ mod tests {
             .expect("transport source should contain production section");
 
         for required in [
-            "handle_submit_intent(&self.store, &self.workspace, SubmitIntentCmd",
+            "handle_submit_intent(&self.store, SubmitIntentCmd",
             "handle_wake_work(",
             "handle_create_company(",
             "handle_create_contract_draft(",

@@ -6,8 +6,8 @@ use std::{
 use crate::{
     adapter::{
         coclai::assets::{
-            RuntimeAssets, AGENTS_ASSET_PATH, TRANSITION_EXECUTOR_SKILL_PATH,
-            TRANSITION_INTENT_SCHEMA_PATH,
+            RuntimeAssets, AGENTS_ASSET_PATH, EXECUTE_TURN_OUTPUT_SCHEMA_PATH,
+            TRANSITION_EXECUTOR_SKILL_PATH, TRANSITION_INTENT_SCHEMA_PATH,
         },
         http::{routes::all_routes, server::serve as serve_http, transport::HttpTransport},
         surreal::store::{SurrealStore, DEFAULT_DATABASE, DEFAULT_NAMESPACE},
@@ -57,7 +57,7 @@ pub fn dispatch(command: Command, config: &Config) -> Result<(), BootError> {
                 .map_err(|error| io::Error::other(error.to_string()))?;
             writeln!(
                 stdout,
-                "axiomnexus doctor live; data dir: {}; store_url={}; runtime_policy={}; transport=tcp-http; assets_loaded=yes; agents_asset_path={}; agents_bytes={}; skill_asset_path={}; skill_bytes={}; schema_path={}; schema_bytes={}",
+                "axiomnexus doctor live; data dir: {}; store_url={}; runtime_policy={}; transport=tcp-http; assets_loaded=yes; agents_asset_path={}; agents_bytes={}; skill_asset_path={}; skill_bytes={}; intent_schema_path={}; intent_schema_bytes={}; execute_turn_schema_path={}; execute_turn_schema_bytes={}",
                 config.data_dir.display(),
                 store_url,
                 RUNTIME_RESUME_POLICY,
@@ -66,7 +66,9 @@ pub fn dispatch(command: Command, config: &Config) -> Result<(), BootError> {
                 TRANSITION_EXECUTOR_SKILL_PATH,
                 assets.skill_bytes,
                 TRANSITION_INTENT_SCHEMA_PATH,
-                assets.schema_bytes
+                assets.intent_schema_bytes,
+                EXECUTE_TURN_OUTPUT_SCHEMA_PATH,
+                assets.execute_turn_schema_bytes
             )?;
         }
         Command::Replay => {
@@ -143,7 +145,8 @@ struct ReplaySummary {
 struct DoctorAssetSummary {
     agents_bytes: usize,
     skill_bytes: usize,
-    schema_bytes: usize,
+    intent_schema_bytes: usize,
+    execute_turn_schema_bytes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,7 +178,8 @@ fn doctor_asset_summary(repo_root: &Path) -> Result<DoctorAssetSummary, BootErro
     Ok(DoctorAssetSummary {
         agents_bytes: assets.agents_md.len(),
         skill_bytes: assets.transition_executor_skill.len(),
-        schema_bytes: assets.transition_intent_schema.len(),
+        intent_schema_bytes: assets.transition_intent_schema.len(),
+        execute_turn_schema_bytes: assets.execute_turn_output_schema.len(),
     })
 }
 
@@ -348,7 +352,8 @@ mod tests {
 
     use crate::{
         adapter::coclai::assets::{
-            AGENTS_ASSET_PATH, TRANSITION_EXECUTOR_SKILL_PATH, TRANSITION_INTENT_SCHEMA_PATH,
+            AGENTS_ASSET_PATH, EXECUTE_TURN_OUTPUT_SCHEMA_PATH, TRANSITION_EXECUTOR_SKILL_PATH,
+            TRANSITION_INTENT_SCHEMA_PATH,
         },
         model::{
             ActorId, ActorKind, ContractSetId, ContractSetStatus, DecisionOutcome, LeaseEffect,
@@ -490,10 +495,15 @@ mod tests {
                 )
                 .expect("skill asset should load")
                 .len(),
-                schema_bytes: std::fs::read_to_string(
+                intent_schema_bytes: std::fs::read_to_string(
                     repo_root.join(TRANSITION_INTENT_SCHEMA_PATH)
                 )
-                .expect("schema asset should load")
+                .expect("intent schema asset should load")
+                .len(),
+                execute_turn_schema_bytes: std::fs::read_to_string(
+                    repo_root.join(EXECUTE_TURN_OUTPUT_SCHEMA_PATH)
+                )
+                .expect("execute turn schema asset should load")
                 .len(),
             }
         );

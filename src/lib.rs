@@ -13,6 +13,7 @@ mod tests {
         path::{Path, PathBuf},
     };
 
+    const CANONICAL_EXECUTE_TURN_SCHEMA_PATH: &str = "samples/execute-turn-output.schema.json";
     const CANONICAL_TRANSITION_SCHEMA_PATH: &str = "samples/transition-intent.schema.json";
     const CANONICAL_DEMO_CONTRACT_SAMPLE_PATH: &str = "samples/company-rust-contract.example.json";
     const CANONICAL_AGENTS_ASSET_PATH: &str = ".agents/AGENTS.md";
@@ -95,6 +96,7 @@ mod tests {
         assert!(repo_root
             .join(CANONICAL_TRANSITION_EXECUTOR_SKILL_PATH)
             .exists());
+        assert!(repo_root.join(CANONICAL_EXECUTE_TURN_SCHEMA_PATH).exists());
         assert!(repo_root.join(CANONICAL_TRANSITION_SCHEMA_PATH).exists());
         assert!(repo_root.join(CANONICAL_DEMO_CONTRACT_SAMPLE_PATH).exists());
 
@@ -103,6 +105,18 @@ mod tests {
             assert!(
                 text.contains(CANONICAL_TRANSITION_SCHEMA_PATH),
                 "{path} should reference the canonical transition schema path",
+            );
+        }
+
+        for path in [
+            "README.md",
+            "docs/01-FINAL-TARGET.md",
+            "docs/spec/RUNTIMEPORT-EXECUTE-TURN-SPEC.md",
+        ] {
+            let text = fs::read_to_string(repo_root.join(path)).expect("source file should load");
+            assert!(
+                text.contains(CANONICAL_EXECUTE_TURN_SCHEMA_PATH),
+                "{path} should reference the canonical execute-turn schema path",
             );
         }
 
@@ -116,6 +130,61 @@ mod tests {
                 "{path} should reference the canonical demo contract sample path",
             );
         }
+    }
+
+    #[test]
+    fn canonical_docs_surface_is_present() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let required_docs = [
+            "docs/00-index.md",
+            "docs/00-DESIGN-REVIEW.md",
+            "docs/01-FINAL-TARGET.md",
+            "docs/02-BLUEPRINT.md",
+            "docs/03-DOMAIN-AND-INVARIANTS.md",
+            "docs/04-API-SURFACE.md",
+            "docs/05-QUALITY-GATES.md",
+            "docs/REFERENCES.md",
+            "docs/spec/STOREPORT-SEMANTIC-CONTRACT.md",
+            "docs/spec/RUNTIMEPORT-EXECUTE-TURN-SPEC.md",
+            "docs/spec/CONFORMANCE-SUITE.md",
+            "docs/adr/ADR-003-remove-workspaceport.md",
+            "docs/adr/ADR-004-surreal-first-postgres-later.md",
+        ];
+
+        for path in required_docs {
+            assert!(repo_root.join(path).exists(), "{path} should exist");
+        }
+
+        let index =
+            fs::read_to_string(repo_root.join("docs/00-index.md")).expect("docs index should load");
+        for path in [
+            "00-DESIGN-REVIEW.md",
+            "01-FINAL-TARGET.md",
+            "02-BLUEPRINT.md",
+            "03-DOMAIN-AND-INVARIANTS.md",
+            "04-API-SURFACE.md",
+            "05-QUALITY-GATES.md",
+            "spec/STOREPORT-SEMANTIC-CONTRACT.md",
+            "spec/RUNTIMEPORT-EXECUTE-TURN-SPEC.md",
+        ] {
+            assert!(
+                index.contains(path),
+                "docs index should mention the promoted canonical path {path}",
+            );
+        }
+    }
+
+    #[test]
+    fn execute_turn_contract_includes_gate_plan_and_observations() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let runtime_port = fs::read_to_string(repo_root.join("src/port/runtime.rs"))
+            .expect("runtime port should load");
+        let schema = fs::read_to_string(repo_root.join(CANONICAL_EXECUTE_TURN_SCHEMA_PATH))
+            .expect("execute turn schema should load");
+
+        assert!(runtime_port.contains("pub(crate) gate_plan: Vec<GateCommandSpec>"));
+        assert!(runtime_port.contains("pub(crate) observations: RuntimeObservations"));
+        assert!(schema.contains("\"observations\""));
     }
 
     fn rust_files_under(dir: &Path) -> Vec<PathBuf> {
