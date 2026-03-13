@@ -6,6 +6,7 @@ use crate::port::store::{CommandStorePort, CreateCompanyReq, StoreError};
 pub(crate) struct CreateCompanyCmd {
     pub(crate) name: String,
     pub(crate) description: String,
+    pub(crate) runtime_hard_stop_cents: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -20,6 +21,7 @@ pub(crate) fn handle_create_company(
     let created = store.create_company(CreateCompanyReq {
         name: cmd.name,
         description: cmd.description,
+        runtime_hard_stop_cents: cmd.runtime_hard_stop_cents,
     })?;
 
     Ok(CreateCompanyAck {
@@ -42,6 +44,7 @@ mod tests {
             CreateCompanyCmd {
                 name: "Acme".to_owned(),
                 description: "release scope".to_owned(),
+                runtime_hard_stop_cents: None,
             },
         )
         .expect("company create should succeed");

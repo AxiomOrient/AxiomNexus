@@ -1,6 +1,8 @@
 use std::{error::Error, fmt};
 
-use crate::model::{ConsumptionUsage, TaskSession, TransitionIntent, WorkSnapshot};
+use crate::model::{
+    ConsumptionUsage, SessionInvalidationReason, TaskSession, TransitionIntent, WorkSnapshot,
+};
 
 use crate::port::store::SessionKey;
 
@@ -31,6 +33,7 @@ pub(crate) struct ExecuteTurnOutcome {
     pub(crate) result: RuntimeResult,
     pub(crate) resumed: bool,
     pub(crate) repair_count: u8,
+    pub(crate) session_reset_reason: Option<SessionInvalidationReason>,
     pub(crate) prompt_envelope: String,
 }
 

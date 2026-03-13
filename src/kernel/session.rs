@@ -1,17 +1,46 @@
-use crate::model::TaskSession;
+use crate::model::{
+    workspace_fingerprint, AgentId, RuntimeKind, SessionInvalidationReason, TaskSession, WorkId,
+};
+
+pub(crate) fn session_invalidation_reason(
+    existing: &TaskSession,
+    agent_id: &AgentId,
+    work_id: &WorkId,
+    cwd: &str,
+    runtime: RuntimeKind,
+) -> Option<SessionInvalidationReason> {
+    if existing.agent_id != *agent_id {
+        return Some(SessionInvalidationReason::Agent);
+    }
+    if existing.work_id != *work_id {
+        return Some(SessionInvalidationReason::Work);
+    }
+    if existing.workspace_fingerprint != workspace_fingerprint(cwd) {
+        return Some(SessionInvalidationReason::Workspace);
+    }
+    if existing.runtime != runtime {
+        return Some(SessionInvalidationReason::Runtime);
+    }
+
+    None
+}
 
 pub(crate) fn advance_session(
     existing: Option<&TaskSession>,
     candidate: TaskSession,
-    invalid_session: bool,
+    invalidation_reason: Option<SessionInvalidationReason>,
 ) -> TaskSession {
     match existing {
         Some(current)
-            if !invalid_session
-                && current.agent_id == candidate.agent_id
-                && current.work_id == candidate.work_id
-                && current.cwd == candidate.cwd
-                && current.runtime == candidate.runtime =>
+            if invalidation_reason.is_none()
+                && session_invalidation_reason(
+                    current,
+                    &candidate.agent_id,
+                    &candidate.work_id,
+                    &candidate.cwd,
+                    candidate.runtime,
+                )
+                .is_none() =>
         {
             let mut resumed = current.clone();
             resumed.contract_rev = candidate.contract_rev;

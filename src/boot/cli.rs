@@ -37,6 +37,11 @@ where
     Ok(command)
 }
 
+#[cfg(test)]
+pub(crate) fn usage_text() -> String {
+    usage()
+}
+
 fn usage() -> String {
     [
         "usage: axiomnexus <command>",

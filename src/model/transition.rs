@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     ActorId, ActorKind, CompanyId, EvidenceBundle, EvidenceInline, EvidenceRef, LeaseId,
-    ReasonCode, Rev, WorkId, WorkSnapshot,
+    ReasonCode, Rev, RunId, SessionId, WorkId, WorkSnapshot,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,8 +62,14 @@ pub(crate) struct TransitionRecord {
     pub(crate) work_id: WorkId,
     pub(crate) actor_kind: ActorKind,
     pub(crate) actor_id: ActorId,
+    #[serde(default)]
+    pub(crate) run_id: Option<RunId>,
+    #[serde(default)]
+    pub(crate) session_id: Option<SessionId>,
     pub(crate) lease_id: Option<LeaseId>,
     pub(crate) expected_rev: Rev,
+    pub(crate) contract_set_id: super::ContractSetId,
+    pub(crate) contract_rev: super::ContractRev,
     pub(crate) before_status: super::WorkStatus,
     pub(crate) after_status: Option<super::WorkStatus>,
     pub(crate) outcome: DecisionOutcome,

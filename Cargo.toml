@@ -3,10 +3,6 @@ name = "axiomnexus"
 version = "0.1.0"
 edition = "2021"
 
-[workspace]
-members = [".", "crates/axiomnexus-governance"]
-resolver = "2"
-
 [lib]
 path = "src/lib.rs"
 

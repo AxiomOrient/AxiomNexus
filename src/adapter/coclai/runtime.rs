@@ -12,7 +12,7 @@ use coclai::runtime::{Client, ClientError, PromptRunError, RpcError, SessionConf
 use serde_json::Value;
 
 use crate::{
-    model::{ConsumptionUsage, TransitionIntent},
+    model::{ConsumptionUsage, SessionInvalidationReason, TransitionIntent},
     port::runtime::{
         ExecuteTurnOutcome, ExecuteTurnReq, PromptEnvelopeInput, RuntimeError, RuntimeErrorKind,
         RuntimeHandle, RuntimePort, RuntimeResult,
@@ -150,37 +150,31 @@ impl CoclaiRuntime {
 
     fn execute_turn_inner(&self, req: ExecuteTurnReq) -> Result<ExecuteTurnOutcome, RuntimeError> {
         let prompt_envelope = self.build_prompt_envelope(&req.prompt_input);
-        let should_resume = req.existing_session.as_ref().is_some_and(|session| {
-            session.agent_id == req.session_key.agent_id
-                && session.work_id == req.session_key.work_id
-                && session.cwd == req.cwd
-                && session.runtime == crate::model::RuntimeKind::Coclai
-        });
-
         let mut resumed = false;
         let mut repair_count = 0;
+        let mut session_reset_reason = None;
         let start_req = StartTurn {
             session_key: req.session_key.clone(),
             cwd: req.cwd.clone(),
             prompt_envelope: prompt_envelope.clone(),
         };
-        let mut handle =
-            if let Some(session) = req.existing_session.as_ref().filter(|_| should_resume) {
-                resumed = true;
-                self.resume_turn(ResumeTurn {
-                    session_key: req.session_key.clone(),
-                    runtime_session_id: session.runtime_session_id.clone(),
-                    cwd: req.cwd.clone(),
-                    prompt_envelope: prompt_envelope.clone(),
-                })?
-            } else {
-                self.start_turn(start_req.clone())?
-            };
+        let mut handle = if let Some(session) = req.existing_session.as_ref() {
+            resumed = true;
+            self.resume_turn(ResumeTurn {
+                session_key: req.session_key.clone(),
+                runtime_session_id: session.runtime_session_id.clone(),
+                cwd: req.cwd.clone(),
+                prompt_envelope: prompt_envelope.clone(),
+            })?
+        } else {
+            self.start_turn(start_req.clone())?
+        };
 
         loop {
             let result = self.result_turn(handle.clone())?;
             if result.invalid_session && resumed {
                 resumed = false;
+                session_reset_reason = Some(SessionInvalidationReason::Runtime);
                 handle = self.start_turn(start_req.clone())?;
                 continue;
             }
@@ -191,6 +185,7 @@ impl CoclaiRuntime {
                     result,
                     resumed,
                     repair_count,
+                    session_reset_reason,
                     prompt_envelope,
                 });
             }
@@ -554,13 +549,17 @@ fn is_invalid_session_rpc(error: &RpcError) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::Path, time::SystemTime};
+    use std::{fs, path::Path, time::SystemTime};
 
     use crate::{
+        adapter::coclai::assets::{
+            AGENTS_ASSET_PATH, TRANSITION_EXECUTOR_SKILL_PATH, TRANSITION_INTENT_SCHEMA_PATH,
+        },
         model::{
-            AgentId, CompanyId, ConsumptionUsage, ContractSetId, LeaseId, Priority, RuntimeKind,
-            SessionId, TaskSession, TransitionIntent, TransitionKind, WorkId, WorkKind, WorkPatch,
-            WorkSnapshot, WorkStatus,
+            workspace_fingerprint, AgentId, CompanyId, ConsumptionUsage, ContractSetId, LeaseId,
+            Priority, RuntimeKind, SessionId, SessionInvalidationReason, TaskSession,
+            TransitionIntent, TransitionKind, WorkId, WorkKind, WorkPatch, WorkSnapshot,
+            WorkStatus,
         },
         port::{
             runtime::{ExecuteTurnReq, PromptEnvelopeInput, RuntimePort},
@@ -574,6 +573,28 @@ mod tests {
     const WORK_ID: &str = "11111111-1111-4111-8111-111111111111";
     const AGENT_ID: &str = "22222222-2222-4222-8222-222222222222";
     const LEASE_ID: &str = "33333333-3333-4333-8333-333333333333";
+
+    #[test]
+    fn from_repo_root_loads_canonical_runtime_assets() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let runtime = CoclaiRuntime::from_repo_root(repo_root).expect("runtime assets should load");
+
+        assert_eq!(
+            runtime.assets.agents_md,
+            fs::read_to_string(repo_root.join(AGENTS_ASSET_PATH))
+                .expect("agents asset should load")
+        );
+        assert_eq!(
+            runtime.assets.transition_executor_skill,
+            fs::read_to_string(repo_root.join(TRANSITION_EXECUTOR_SKILL_PATH))
+                .expect("skill asset should load")
+        );
+        assert_eq!(
+            runtime.assets.transition_intent_schema,
+            fs::read_to_string(repo_root.join(TRANSITION_INTENT_SCHEMA_PATH))
+                .expect("schema asset should load")
+        );
+    }
 
     #[test]
     fn prompt_envelope_contains_contract_and_output_rule() {
@@ -619,11 +640,15 @@ mod tests {
 
         assert!(!outcome.resumed);
         assert_eq!(outcome.repair_count, 0);
+        assert_eq!(
+            outcome.session_reset_reason,
+            Some(SessionInvalidationReason::Runtime)
+        );
         assert_eq!(outcome.result.intent.kind, TransitionKind::Complete);
     }
 
     #[test]
-    fn execute_turn_retries_invalid_output_twice_then_fails() {
+    fn execute_turn_retries_invalid_output_once_then_fails() {
         let assets = RuntimeAssets::load_from_repo_root(Path::new(env!("CARGO_MANIFEST_DIR")))
             .expect("assets should load");
         let runtime = CoclaiRuntime::with_scripted_replies(
@@ -631,19 +656,44 @@ mod tests {
             vec![
                 scripted_invalid_reply("runtime-1"),
                 scripted_invalid_reply("runtime-1"),
-                scripted_invalid_reply("runtime-1"),
             ],
         );
 
         let error = runtime
             .execute_turn(execute_turn_req(None))
-            .expect_err("three invalid outputs should exhaust repair budget");
+            .expect_err("second invalid output should exhaust repair budget");
 
         assert_eq!(
             error.kind,
             crate::port::runtime::RuntimeErrorKind::InvalidOutput
         );
         assert!(error.message.contains("repair retry budget exhausted"));
+    }
+
+    #[test]
+    fn execute_turn_accepts_valid_output_after_single_repair_retry() {
+        let assets = RuntimeAssets::load_from_repo_root(Path::new(env!("CARGO_MANIFEST_DIR")))
+            .expect("assets should load");
+        let runtime = CoclaiRuntime::with_scripted_replies(
+            assets,
+            vec![
+                scripted_invalid_reply("runtime-1"),
+                ScriptedReply {
+                    handle: handle("runtime-1"),
+                    raw_output: valid_output("complete", Some("fixed"), true),
+                    intent: intent(TransitionKind::Complete, Some("fixed".to_owned())),
+                    usage: usage(),
+                    invalid_session: false,
+                },
+            ],
+        );
+
+        let outcome = runtime
+            .execute_turn(execute_turn_req(None))
+            .expect("single repair retry should succeed");
+
+        assert_eq!(outcome.repair_count, 1);
+        assert_eq!(outcome.result.intent.kind, TransitionKind::Complete);
     }
 
     #[test]
@@ -667,6 +717,7 @@ mod tests {
 
         assert!(!outcome.resumed);
         assert_eq!(outcome.repair_count, 0);
+        assert_eq!(outcome.session_reset_reason, None);
         assert_eq!(outcome.result.intent.kind, TransitionKind::ProposeProgress);
     }
 
@@ -736,6 +787,7 @@ mod tests {
             runtime: RuntimeKind::Coclai,
             runtime_session_id: "runtime-old".to_owned(),
             cwd: cwd.to_owned(),
+            workspace_fingerprint: workspace_fingerprint(cwd),
             contract_rev: 1,
             last_record_id: None,
             last_decision_summary: Some("accepted".to_owned()),

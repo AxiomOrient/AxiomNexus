@@ -8,7 +8,10 @@ pub(crate) mod port;
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
 
     const CANONICAL_TRANSITION_SCHEMA_PATH: &str = "samples/transition-intent.schema.json";
     const CANONICAL_DEMO_CONTRACT_SAMPLE_PATH: &str = "samples/company-rust-contract.example.json";
@@ -38,155 +41,38 @@ mod tests {
     #[test]
     fn kernel_and_model_stay_free_of_forbidden_dependencies() {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let checks = [
-            (
-                "src/kernel/mod.rs",
-                [
-                    "tokio",
-                    "sqlx",
-                    "reqwest",
-                    "std::fs",
-                    "std::process::Command",
-                ],
-            ),
-            (
-                "src/kernel/apply.rs",
-                [
-                    "tokio",
-                    "sqlx",
-                    "reqwest",
-                    "std::fs",
-                    "std::process::Command",
-                ],
-            ),
-            (
-                "src/kernel/claim.rs",
-                [
-                    "tokio",
-                    "sqlx",
-                    "reqwest",
-                    "std::fs",
-                    "std::process::Command",
-                ],
-            ),
-            (
-                "src/kernel/decide.rs",
-                [
-                    "tokio",
-                    "sqlx",
-                    "reqwest",
-                    "std::fs",
-                    "std::process::Command",
-                ],
-            ),
-            (
-                "src/kernel/session.rs",
-                [
-                    "tokio",
-                    "sqlx",
-                    "reqwest",
-                    "std::fs",
-                    "std::process::Command",
-                ],
-            ),
-            (
-                "src/kernel/wake.rs",
-                [
-                    "tokio",
-                    "sqlx",
-                    "reqwest",
-                    "std::fs",
-                    "std::process::Command",
-                ],
-            ),
-            (
-                "src/model/contract.rs",
-                [
-                    "tokio",
-                    "sqlx",
-                    "reqwest",
-                    "std::fs",
-                    "std::process::Command",
-                ],
-            ),
-            (
-                "src/model/evidence.rs",
-                [
-                    "tokio",
-                    "sqlx",
-                    "reqwest",
-                    "std::fs",
-                    "std::process::Command",
-                ],
-            ),
-            (
-                "src/model/ids.rs",
-                [
-                    "tokio",
-                    "sqlx",
-                    "reqwest",
-                    "std::fs",
-                    "std::process::Command",
-                ],
-            ),
-            (
-                "src/model/lease.rs",
-                [
-                    "tokio",
-                    "sqlx",
-                    "reqwest",
-                    "std::fs",
-                    "std::process::Command",
-                ],
-            ),
-            (
-                "src/model/session.rs",
-                [
-                    "tokio",
-                    "sqlx",
-                    "reqwest",
-                    "std::fs",
-                    "std::process::Command",
-                ],
-            ),
-            (
-                "src/model/transition.rs",
-                [
-                    "tokio",
-                    "sqlx",
-                    "reqwest",
-                    "std::fs",
-                    "std::process::Command",
-                ],
-            ),
-            (
-                "src/model/wake.rs",
-                [
-                    "tokio",
-                    "sqlx",
-                    "reqwest",
-                    "std::fs",
-                    "std::process::Command",
-                ],
-            ),
-            (
-                "src/model/work.rs",
-                [
-                    "tokio",
-                    "sqlx",
-                    "reqwest",
-                    "std::fs",
-                    "std::process::Command",
-                ],
-            ),
+        let forbidden_tokens = [
+            "tokio",
+            "sqlx",
+            "reqwest",
+            "std::fs",
+            "std::process::Command",
         ];
 
-        for (path, forbidden_tokens) in checks {
-            let text = fs::read_to_string(repo_root.join(path)).expect("source file should load");
+        for path in rust_files_under(&repo_root.join("src/kernel")) {
+            let display_path = path
+                .strip_prefix(repo_root)
+                .expect("kernel path should stay under repo root");
+            let text = fs::read_to_string(&path).expect("source file should load");
             for token in forbidden_tokens {
                 assert!(
                     !text.contains(token),
-                    "{path} should not depend on forbidden token {token}"
+                    "{} should not depend on forbidden token {token}",
+                    display_path.display()
+                );
+            }
+        }
+
+        for path in rust_files_under(&repo_root.join("src/model")) {
+            let display_path = path
+                .strip_prefix(repo_root)
+                .expect("model path should stay under repo root");
+            let text = fs::read_to_string(&path).expect("source file should load");
+            for token in forbidden_tokens {
+                assert!(
+                    !text.contains(token),
+                    "{} should not depend on forbidden token {token}",
+                    display_path.display()
                 );
             }
         }
@@ -230,5 +116,24 @@ mod tests {
                 "{path} should reference the canonical demo contract sample path",
             );
         }
+    }
+
+    fn rust_files_under(dir: &Path) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        let entries = fs::read_dir(dir).expect("source dir should exist");
+        for entry in entries {
+            let entry = entry.expect("dir entry should load");
+            let path = entry.path();
+            if entry.file_type().expect("file type should load").is_dir() {
+                files.extend(rust_files_under(&path));
+                continue;
+            }
+
+            if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+                files.push(path);
+            }
+        }
+        files.sort();
+        files
     }
 }

@@ -58,3 +58,35 @@ pub fn run() -> Result<(), BootError> {
 
     wire::dispatch(command, &config)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::cli::usage_text;
+
+    #[test]
+    fn cli_usage_and_readme_stay_in_sync_for_runtime_commands() {
+        let usage = usage_text();
+        let readme = fs::read_to_string("README.md").expect("README should load");
+
+        for command in [
+            "serve",
+            "migrate",
+            "doctor",
+            "replay",
+            "export",
+            "import",
+            "contract check",
+        ] {
+            assert!(
+                usage.contains(command),
+                "cli usage should contain runtime command {command}"
+            );
+            assert!(
+                readme.contains(command),
+                "README should contain runtime command {command}"
+            );
+        }
+    }
+}

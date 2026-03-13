@@ -6,14 +6,17 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+mod commit;
+mod query;
+
 use crate::{
     adapter::store_support,
     kernel,
     model::{
         ActorId, ActorKind, AgentId, AgentStatus, BillingKind, CompanyId, CompanyProfile,
         ConsumptionUsage, ContractSet, ContractSetId, ContractSetStatus, LeaseEffect, LeaseId,
-        LeaseReleaseReason, PendingWake, PendingWakeEffect, Priority, RunId, TaskSession,
-        TransitionKind, TransitionRecord, TransitionRule, WorkId, WorkKind, WorkLease,
+        LeaseReleaseReason, PendingWake, PendingWakeEffect, Priority, RunId, RunStatus,
+        TaskSession, TransitionKind, TransitionRecord, TransitionRule, WorkId, WorkKind, WorkLease,
         WorkSnapshot, WorkStatus,
     },
     port::store::{
@@ -118,18 +121,9 @@ struct RegisteredRun {
     company_id: CompanyId,
     agent_id: AgentId,
     work_id: WorkId,
-    status: RunLifecycle,
+    status: RunStatus,
     created_at: SystemTime,
     updated_at: SystemTime,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-enum RunLifecycle {
-    Queued,
-    Running,
-    Succeeded,
-    Failed,
-    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -261,6 +255,8 @@ impl StorePort for MemoryStore {
             company_id: CompanyId::from(sequenced_id(next.next_company_seq)),
             name: req.name,
             description: req.description,
+            runtime_hard_stop_cents: req.runtime_hard_stop_cents,
+            recorded_estimated_cost_cents: 0,
         };
         next.companies
             .insert(profile.company_id.as_str().to_owned(), profile.clone());
@@ -479,285 +475,36 @@ impl StorePort for MemoryStore {
         })
     }
 
+    fn claim_lease(&self, req: ClaimLeaseReq) -> Result<ClaimLeaseRes, StoreError> {
+        MemoryStore::claim_lease(self, req)
+    }
+
     fn read_board(&self) -> BoardReadModel {
-        let state = self.state.borrow();
-
-        let running_runs = state
-            .runs
-            .values()
-            .filter(|run| run.status == RunLifecycle::Running)
-            .map(|run| RunningRunView {
-                run_id: run.run_id.as_str().to_owned(),
-                agent_id: run.agent_id.as_str().to_owned(),
-                work_id: run.work_id.as_str().to_owned(),
-                lease_id: state
-                    .leases
-                    .values()
-                    .find(|lease| {
-                        lease.released_at.is_none()
-                            && lease.run_id.as_ref() == Some(&run.run_id)
-                            && lease.work_id == run.work_id
-                            && lease.agent_id == run.agent_id
-                    })
-                    .map(|lease| lease.lease_id.as_str().to_owned()),
-            })
-            .collect::<Vec<_>>();
-        let running_agents = running_runs
-            .iter()
-            .map(|run| run.agent_id.clone())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let pending_wakes = state
-            .pending_wakes
-            .values()
-            .map(|wake| wake.work_id.as_str().to_owned())
-            .collect::<Vec<_>>();
-        let pending_wake_details = state
-            .pending_wakes
-            .values()
-            .map(|wake| PendingWakeSummaryView {
-                work_id: wake.work_id.as_str().to_owned(),
-                count: wake.count,
-                latest_reason: wake.latest_reason.clone(),
-                obligations: wake.obligation_json.iter().cloned().collect(),
-            })
-            .collect::<Vec<_>>();
-        let blocked_work = state
-            .snapshots
-            .values()
-            .filter(|snapshot| snapshot.status == WorkStatus::Blocked)
-            .map(|snapshot| snapshot.work_id.as_str().to_owned())
-            .collect::<Vec<_>>();
-        let recent_transition_records = state
-            .transition_records
-            .iter()
-            .rev()
-            .take(5)
-            .map(|record| record.record_id.as_str().to_owned())
-            .collect::<Vec<_>>();
-        let recent_transition_details = state
-            .transition_records
-            .iter()
-            .rev()
-            .take(5)
-            .map(|record| {
-                store_support::board_transition_detail(
-                    record.record_id.as_str(),
-                    record.work_id.as_str(),
-                    transition_kind_label(record.kind),
-                    decision_outcome_label(record.outcome),
-                    store_support::transition_summary(
-                        record.evidence_inline.as_ref(),
-                        &record.patch,
-                    ),
-                )
-            })
-            .collect::<Vec<_>>();
-        let recent_gate_failures = state
-            .transition_records
-            .iter()
-            .rev()
-            .filter(|record| store_support::is_gate_failure(record.outcome, &record.gate_results))
-            .take(5)
-            .map(|record| record.record_id.as_str().to_owned())
-            .collect::<Vec<_>>();
-        let recent_gate_failure_details = state
-            .transition_records
-            .iter()
-            .rev()
-            .filter(|record| store_support::is_gate_failure(record.outcome, &record.gate_results))
-            .take(5)
-            .map(|record| {
-                store_support::board_gate_failure_detail(
-                    record.record_id.as_str(),
-                    record.work_id.as_str(),
-                    decision_outcome_label(record.outcome),
-                    store_support::failed_gate_details(&record.gate_results),
-                )
-            })
-            .collect::<Vec<_>>();
-
-        BoardReadModel {
-            running_agents,
-            running_runs,
-            pending_wakes,
-            pending_wake_details,
-            blocked_work,
-            recent_transition_records,
-            recent_transition_details,
-            recent_gate_failures,
-            recent_gate_failure_details,
-            consumption_summary: consumption_summary(&state.consumption_events),
-        }
+        query::read_board(self)
     }
 
     fn read_companies(&self) -> CompanyReadModel {
-        let state = self.state.borrow();
-        CompanyReadModel {
-            items: state
-                .companies
-                .values()
-                .map(|company| {
-                    let active_contract = active_contract_for_company(&state, &company.company_id);
-                    CompanySummaryView {
-                        company_id: company.company_id.as_str().to_owned(),
-                        name: company.name.clone(),
-                        description: company.description.clone(),
-                        active_contract_set_id: active_contract
-                            .as_ref()
-                            .map(|contract| contract.contract_set_id.as_str().to_owned()),
-                        active_contract_revision: active_contract
-                            .as_ref()
-                            .map(|contract| contract.revision),
-                        agent_count: state
-                            .agents
-                            .values()
-                            .filter(|agent| agent.company_id == company.company_id)
-                            .count(),
-                        work_count: state
-                            .snapshots
-                            .values()
-                            .filter(|snapshot| snapshot.company_id == company.company_id)
-                            .count(),
-                    }
-                })
-                .collect(),
-        }
+        query::read_companies(self)
     }
 
     fn read_work(&self, work_id: Option<&WorkId>) -> Result<WorkReadModel, StoreError> {
-        let state = self.state.borrow();
-        let items = if let Some(work_id) = work_id {
-            vec![work_summary_for(&state, work_id).ok_or_else(|| not_found("read_work", work_id))?]
-        } else {
-            state
-                .snapshots
-                .values()
-                .map(|snapshot| {
-                    let audit_entries = work_activity_entries(&state, &snapshot.work_id);
-                    work_summary_with_comments(
-                        snapshot,
-                        state.pending_wakes.get(snapshot.work_id.as_str()),
-                        &state.contract_history,
-                        &state.comments,
-                        &audit_entries,
-                    )
-                })
-                .collect::<Vec<_>>()
-        };
-
-        Ok(WorkReadModel { items })
+        query::read_work(self, work_id)
     }
 
     fn read_agents(&self) -> AgentReadModel {
-        let state = self.state.borrow();
-        let active_agents = state
-            .leases
-            .values()
-            .filter(|lease| lease.released_at.is_none())
-            .map(|lease| lease.agent_id.as_str().to_owned())
-            .collect::<Vec<_>>();
-        let mut recent_runs = state.runs.values().cloned().collect::<Vec<_>>();
-        recent_runs.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
-        let mut current_sessions = state.sessions.values().cloned().collect::<Vec<_>>();
-        current_sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
-
-        AgentReadModel {
-            active_agents,
-            registered_agents: state
-                .agents
-                .values()
-                .map(|agent| AgentSummaryView {
-                    agent_id: agent.agent_id.as_str().to_owned(),
-                    company_id: agent.company_id.as_str().to_owned(),
-                    name: agent.name.clone(),
-                    role: agent.role.clone(),
-                    status: agent.status,
-                })
-                .collect(),
-            recent_runs: recent_runs
-                .into_iter()
-                .take(10)
-                .map(|run| AgentRunView {
-                    run_id: run.run_id.as_str().to_owned(),
-                    agent_id: run.agent_id.as_str().to_owned(),
-                    work_id: run.work_id.as_str().to_owned(),
-                    status: run_status_label(run.status).to_owned(),
-                })
-                .collect(),
-            current_sessions: current_sessions
-                .into_iter()
-                .map(|session| AgentSessionSummaryView {
-                    agent_id: session.agent_id.as_str().to_owned(),
-                    work_id: session.work_id.as_str().to_owned(),
-                    runtime: session.runtime,
-                    runtime_session_id: session.runtime_session_id,
-                    cwd: session.cwd,
-                    contract_rev: session.contract_rev,
-                    last_decision_summary: session.last_decision_summary,
-                    last_gate_summary: session.last_gate_summary,
-                })
-                .collect(),
-            consumption_by_agent: agent_consumption_summaries(&state),
-        }
+        query::read_agents(self)
     }
 
     fn read_activity(&self) -> ActivityReadModel {
-        let state = self.state.borrow();
-        ActivityReadModel {
-            entries: activity_entries(&state),
-        }
+        query::read_activity(self)
     }
 
     fn read_run(&self, run_id: &RunId) -> Result<RunReadModel, StoreError> {
-        let state = self.state.borrow();
-        let run = state
-            .runs
-            .get(run_id.as_str())
-            .ok_or_else(|| run_not_found("read_run", run_id))?;
-        let current_session = state
-            .sessions
-            .values()
-            .find(|session| session.agent_id == run.agent_id && session.work_id == run.work_id)
-            .map(|session| AgentSessionSummaryView {
-                agent_id: session.agent_id.as_str().to_owned(),
-                work_id: session.work_id.as_str().to_owned(),
-                runtime: session.runtime,
-                runtime_session_id: session.runtime_session_id.clone(),
-                cwd: session.cwd.clone(),
-                contract_rev: session.contract_rev,
-                last_decision_summary: session.last_decision_summary.clone(),
-                last_gate_summary: session.last_gate_summary.clone(),
-            });
-
-        Ok(RunReadModel {
-            run_id: run.run_id.as_str().to_owned(),
-            agent_id: run.agent_id.as_str().to_owned(),
-            work_id: run.work_id.as_str().to_owned(),
-            status: run_status_label(run.status).to_owned(),
-            current_session,
-        })
+        query::read_run(self, run_id)
     }
 
     fn read_contracts(&self) -> ContractsReadModel {
-        let state = self.state.borrow();
-        ContractsReadModel {
-            contract_set_id: state.contract.contract_set_id.as_str().to_owned(),
-            name: state.contract.name.clone(),
-            revision: state.contract.revision,
-            status: state.contract.status,
-            revisions: state
-                .contract_history
-                .iter()
-                .map(|contract| ContractRevisionView {
-                    revision: contract.revision,
-                    status: contract.status,
-                    name: contract.name.clone(),
-                })
-                .collect(),
-            rules: state.contract.rules.clone(),
-        }
+        query::read_contracts(self)
     }
 
     fn load_context(&self, work_id: &WorkId) -> Result<WorkContext, StoreError> {
@@ -783,6 +530,39 @@ impl StorePort for MemoryStore {
             pending_wake,
             contract,
         })
+    }
+
+    fn list_work_snapshots(&self) -> Result<Vec<WorkSnapshot>, StoreError> {
+        let mut snapshots = self
+            .state
+            .borrow()
+            .snapshots
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        snapshots.sort_by(|left, right| left.work_id.cmp(&right.work_id));
+        Ok(snapshots)
+    }
+
+    fn load_transition_records(
+        &self,
+        work_id: &WorkId,
+    ) -> Result<Vec<TransitionRecord>, StoreError> {
+        let mut records = self
+            .state
+            .borrow()
+            .transition_records
+            .iter()
+            .filter(|record| record.work_id == *work_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        records.sort_by(|left, right| {
+            left.expected_rev
+                .cmp(&right.expected_rev)
+                .then_with(|| left.happened_at.cmp(&right.happened_at))
+                .then_with(|| left.record_id.cmp(&right.record_id))
+        });
+        Ok(records)
     }
 
     fn merge_wake(&self, req: MergeWakeReq) -> Result<PendingWake, StoreError> {
@@ -827,7 +607,7 @@ impl StorePort for MemoryStore {
             .runs
             .values()
             .filter(|run| {
-                run.status == RunLifecycle::Running
+                run.status == RunStatus::Running
                     && matches!(
                         reaped_at.duration_since(run.updated_at),
                         Ok(elapsed) if elapsed >= timeout
@@ -844,7 +624,7 @@ impl StorePort for MemoryStore {
             let Some(run) = next.runs.get_mut(run_id.as_str()) else {
                 continue;
             };
-            run.status = RunLifecycle::Failed;
+            run.status = RunStatus::TimedOut;
             run.updated_at = reaped_at;
             next.activity_events.push(activity_entry_from_run(run));
 
@@ -855,7 +635,7 @@ impl StorePort for MemoryStore {
                 next.find_open_lease_for_run(&stale_run.work_id, &stale_run.run_id);
             if let Some(lease_id) = released_lease_id.as_ref() {
                 let req = timeout_requeue_commit_req(&snapshot, &stale_run, lease_id, reaped_at);
-                apply_commit_decision_to_state(&mut next, req)?;
+                commit::apply_commit_decision_to_state(&mut next, req)?;
             }
             let follow_up_run_id = next
                 .pending_wakes
@@ -897,13 +677,14 @@ impl StorePort for MemoryStore {
         Ok(state
             .runs
             .values()
-            .filter(|run| run.status == RunLifecycle::Queued)
+            .filter(|run| run.status == RunStatus::Queued)
             .map(|run| QueuedRunCandidate {
                 run_id: run.run_id.clone(),
                 agent_status: state
                     .agents
                     .get(run.agent_id.as_str())
                     .map(|agent| agent.status),
+                budget_blocked: company_budget_hard_stopped(&state, &run.company_id),
                 created_at: run.created_at,
             })
             .collect())
@@ -982,12 +763,54 @@ impl StorePort for MemoryStore {
             return Err(conflict("mark_run_running requires an active agent"));
         }
 
-        let should_record_activity = run.status != RunLifecycle::Running;
-        run.status = RunLifecycle::Running;
+        let should_record_activity = run.status != RunStatus::Running;
+        run.status = RunStatus::Running;
         run.updated_at = updated_at;
         if should_record_activity {
             next.activity_events.push(activity_entry_from_run(run));
         }
+        self.replace_state(next)?;
+        Ok(())
+    }
+
+    fn mark_run_completed(&self, run_id: &RunId) -> Result<(), StoreError> {
+        let mut next = self.cloned_state();
+        let updated_at = next.next_timestamp();
+        let run = next
+            .runs
+            .get_mut(run_id.as_str())
+            .ok_or_else(|| run_not_found("mark_run_completed", run_id))?;
+
+        if !run.status.is_runnable() {
+            return Err(conflict(
+                "mark_run_completed requires a queued or running run",
+            ));
+        }
+
+        run.status = RunStatus::Completed;
+        run.updated_at = updated_at;
+        next.activity_events
+            .push(activity_entry_from_completed_run(run));
+        self.replace_state(next)?;
+        Ok(())
+    }
+
+    fn mark_run_failed(&self, run_id: &RunId, reason: &str) -> Result<(), StoreError> {
+        let mut next = self.cloned_state();
+        let updated_at = next.next_timestamp();
+        let run = next
+            .runs
+            .get_mut(run_id.as_str())
+            .ok_or_else(|| run_not_found("mark_run_failed", run_id))?;
+
+        if !run.status.is_runnable() {
+            return Err(conflict("mark_run_failed requires a queued or running run"));
+        }
+
+        run.status = RunStatus::Failed;
+        run.updated_at = updated_at;
+        next.activity_events
+            .push(activity_entry_from_failed_run(run, reason));
         self.replace_state(next)?;
         Ok(())
     }
@@ -1008,8 +831,10 @@ impl StorePort for MemoryStore {
             .runs
             .get(req.run_id.as_str())
             .ok_or_else(|| run_not_found("record_consumption", &req.run_id))?;
+        let run_company_id = run.company_id.clone();
+        let run_agent_id = run.agent_id.clone();
 
-        if run.company_id != req.company_id || run.agent_id != req.agent_id {
+        if run_company_id != req.company_id || run_agent_id != req.agent_id {
             return Err(conflict(
                 "record_consumption rejects company/run or agent/run boundary violations",
             ));
@@ -1017,6 +842,7 @@ impl StorePort for MemoryStore {
 
         next.next_consumption_seq += 1;
         let created_at = next.next_timestamp();
+        let estimated_cost_cents = req.usage.estimated_cost_cents.unwrap_or(0);
         next.consumption_events.push(PersistedConsumptionEvent {
             event_id: format!("consumption-{}", next.next_consumption_seq),
             company_id: req.company_id,
@@ -1026,14 +852,18 @@ impl StorePort for MemoryStore {
             usage: req.usage,
             created_at,
         });
+        if let Some(company) = next.companies.get_mut(run_company_id.as_str()) {
+            company.recorded_estimated_cost_cents += estimated_cost_cents;
+        }
         self.replace_state(next)?;
         Ok(())
     }
 
     fn commit_decision(&self, req: CommitDecisionReq) -> Result<CommitDecisionRes, StoreError> {
         let mut next = self.cloned_state();
-        ensure_commit_preconditions(&next, &req)?;
-        let result = apply_commit_decision_to_state(&mut next, req)?;
+        let authoritative = commit::load_commit_authoritative_state(&next, &req)?;
+        let prepared = commit::prepare_commit_decision(&mut next, req, authoritative);
+        let result = commit::execute_commit_decision_apply(&mut next, prepared)?;
         self.replace_state(next)?;
         Ok(result)
     }
@@ -1146,7 +976,7 @@ impl MemoryState {
                 company_id: CompanyId::from(DEMO_COMPANY_ID),
                 agent_id: AgentId::from(DEMO_AGENT_ID),
                 work_id: WorkId::from(DEMO_DOING_WORK_ID),
-                status: RunLifecycle::Running,
+                status: RunStatus::Running,
                 created_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1),
                 updated_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1),
             },
@@ -1231,9 +1061,9 @@ impl MemoryState {
         {
             let previous_status = run.status;
             run.agent_id = agent_id.clone();
-            run.status = RunLifecycle::Running;
+            run.status = RunStatus::Running;
             run.updated_at = updated_at;
-            if previous_status != RunLifecycle::Running {
+            if previous_status != RunStatus::Running {
                 self.activity_events.push(activity_entry_from_run(run));
             }
             return run.run_id.clone();
@@ -1246,7 +1076,7 @@ impl MemoryState {
             company_id: snapshot.company_id.clone(),
             agent_id: agent_id.clone(),
             work_id: snapshot.work_id.clone(),
-            status: RunLifecycle::Running,
+            status: RunStatus::Running,
             created_at: updated_at,
             updated_at,
         };
@@ -1295,7 +1125,7 @@ impl MemoryState {
                     company_id: snapshot.company_id.clone(),
                     agent_id,
                     work_id: snapshot.work_id.clone(),
-                    status: RunLifecycle::Queued,
+                    status: RunStatus::Queued,
                     created_at: updated_at,
                     updated_at,
                 };
@@ -1344,12 +1174,6 @@ impl MemoryState {
             (agent.company_id == snapshot.company_id && agent.status == AgentStatus::Active)
                 .then(|| agent.agent_id.clone())
         })
-    }
-}
-
-impl RunLifecycle {
-    fn is_runnable(self) -> bool {
-        matches!(self, Self::Queued | Self::Running)
     }
 }
 
@@ -1403,6 +1227,8 @@ fn default_companies() -> BTreeMap<String, CompanyProfile> {
             company_id: CompanyId::from(DEMO_COMPANY_ID),
             name: "AxiomNexus Demo".to_owned(),
             description: "demo company".to_owned(),
+            runtime_hard_stop_cents: None,
+            recorded_estimated_cost_cents: 0,
         },
     );
     companies.insert(
@@ -1411,6 +1237,8 @@ fn default_companies() -> BTreeMap<String, CompanyProfile> {
             company_id: CompanyId::from(DEMO_FOREIGN_COMPANY_ID),
             name: "Foreign Demo".to_owned(),
             description: "foreign boundary demo".to_owned(),
+            runtime_hard_stop_cents: None,
+            recorded_estimated_cost_cents: 0,
         },
     );
     companies
@@ -1596,6 +1424,17 @@ fn consumption_summary(events: &[PersistedConsumptionEvent]) -> ConsumptionSumma
     summary
 }
 
+fn company_budget_hard_stopped(state: &MemoryState, company_id: &CompanyId) -> bool {
+    let Some(company) = state.companies.get(company_id.as_str()) else {
+        return false;
+    };
+    let Some(limit) = company.runtime_hard_stop_cents else {
+        return false;
+    };
+
+    company.recorded_estimated_cost_cents >= limit
+}
+
 fn agent_consumption_summaries(state: &MemoryState) -> Vec<AgentConsumptionSummaryView> {
     state
         .agents
@@ -1632,6 +1471,16 @@ struct TimedActivityEntry {
     sort_key: SystemTime,
     priority: u8,
     view: ActivityEntryView,
+}
+
+struct CommitAuthoritativeState {
+    snapshot: WorkSnapshot,
+    live_lease: Option<WorkLease>,
+}
+
+struct PreparedCommitDecision {
+    req: CommitDecisionReq,
+    activity_event: TimedActivityEntry,
 }
 
 fn activity_entry_from_transition(record: &TransitionRecord) -> TimedActivityEntry {
@@ -1675,6 +1524,44 @@ fn activity_entry_from_run(run: &RegisteredRun) -> TimedActivityEntry {
             before_status: None,
             after_status: None,
             outcome: None,
+            evidence_summary: None,
+        },
+    }
+}
+
+fn activity_entry_from_failed_run(run: &RegisteredRun, reason: &str) -> TimedActivityEntry {
+    TimedActivityEntry {
+        sort_key: run.updated_at,
+        priority: 1,
+        view: ActivityEntryView {
+            event_kind: "run".to_owned(),
+            work_id: run.work_id.as_str().to_owned(),
+            summary: format!("run {} failed: {reason}", run.run_id),
+            actor_kind: None,
+            actor_id: None,
+            source: Some("runtime".to_owned()),
+            before_status: None,
+            after_status: None,
+            outcome: Some("failed".to_owned()),
+            evidence_summary: None,
+        },
+    }
+}
+
+fn activity_entry_from_completed_run(run: &RegisteredRun) -> TimedActivityEntry {
+    TimedActivityEntry {
+        sort_key: run.updated_at,
+        priority: 1,
+        view: ActivityEntryView {
+            event_kind: "run".to_owned(),
+            work_id: run.work_id.as_str().to_owned(),
+            summary: format!("run {} completed", run.run_id),
+            actor_kind: None,
+            actor_id: None,
+            source: Some("runtime".to_owned()),
+            before_status: None,
+            after_status: None,
+            outcome: Some("completed".to_owned()),
             evidence_summary: None,
         },
     }
@@ -1752,13 +1639,14 @@ fn transition_kind_label(kind: TransitionKind) -> &'static str {
     }
 }
 
-fn run_status_label(status: RunLifecycle) -> &'static str {
+fn run_status_label(status: RunStatus) -> &'static str {
     match status {
-        RunLifecycle::Queued => "queued",
-        RunLifecycle::Running => "running",
-        RunLifecycle::Succeeded => "succeeded",
-        RunLifecycle::Failed => "failed",
-        RunLifecycle::Cancelled => "cancelled",
+        RunStatus::Queued => "queued",
+        RunStatus::Running => "running",
+        RunStatus::Completed => "completed",
+        RunStatus::Failed => "failed",
+        RunStatus::Cancelled => "cancelled",
+        RunStatus::TimedOut => "timed_out",
     }
 }
 
@@ -1813,18 +1701,18 @@ fn ensure_commit_preconditions(
 ) -> Result<(), StoreError> {
     let snapshot = state
         .snapshots
-        .get(req.record.work_id.as_str())
-        .ok_or_else(|| not_found("commit_decision", &req.record.work_id))?;
+        .get(req.context.record.work_id.as_str())
+        .ok_or_else(|| not_found("commit_decision", &req.context.record.work_id))?;
 
-    if snapshot.rev != req.record.expected_rev {
+    if snapshot.rev != req.context.record.expected_rev {
         return Err(conflict(
             "commit_decision expected_rev does not match authoritative snapshot",
         ));
     }
 
-    match req.decision.lease_effect {
+    match req.effects.lease {
         LeaseEffect::Acquire => {
-            if req.record.lease_id.is_none() {
+            if req.context.record.lease_id.is_none() {
                 return Err(conflict(
                     "commit_decision acquire requires a lease_id on the record",
                 ));
@@ -1834,14 +1722,14 @@ fn ensure_commit_preconditions(
                     "commit_decision acquire requires no active lease on the authoritative snapshot",
                 ));
             }
-            if has_open_lease_for_work(state, &req.record.work_id) {
+            if has_open_lease_for_work(state, &req.context.record.work_id) {
                 return Err(conflict(
                     "commit_decision acquire requires no open lease on the authoritative snapshot",
                 ));
             }
         }
         LeaseEffect::Keep | LeaseEffect::Renew | LeaseEffect::Release | LeaseEffect::None => {
-            let Some(lease_id) = req.record.lease_id.as_ref() else {
+            let Some(lease_id) = req.context.record.lease_id.as_ref() else {
                 return Ok(());
             };
             let live_lease = state
@@ -1862,90 +1750,6 @@ fn ensure_commit_preconditions(
     }
 
     Ok(())
-}
-
-fn apply_commit_decision_to_state(
-    next: &mut MemoryState,
-    req: CommitDecisionReq,
-) -> Result<CommitDecisionRes, StoreError> {
-    next.transition_records.push(req.record.clone());
-    let activity_event = activity_entry_from_transition(&req.record);
-    next.activity_events.push(activity_event.clone());
-
-    match req.decision.pending_wake_effect {
-        PendingWakeEffect::Clear => {
-            next.pending_wakes.remove(req.record.work_id.as_str());
-        }
-        PendingWakeEffect::Retain | PendingWakeEffect::Merge | PendingWakeEffect::None => {}
-    }
-
-    match req.decision.lease_effect {
-        LeaseEffect::Acquire => {
-            let lease_id = req.record.lease_id.as_ref().ok_or_else(|| {
-                conflict("commit_decision acquire requires a lease_id on the record")
-            })?;
-            let agent_id = claim_actor_agent_id(&req.record, "commit_decision")?;
-            let _ = acquire_claim_lease(
-                next,
-                &req.record.work_id,
-                &agent_id,
-                lease_id,
-                req.record.happened_at,
-                "commit_decision",
-            )?;
-        }
-        LeaseEffect::Keep | LeaseEffect::Renew => {
-            if let Some(lease_id) = req.record.lease_id.as_ref() {
-                if let Some(lease) = next.leases.get_mut(lease_id.as_str()) {
-                    lease.released_at = None;
-                    lease.release_reason = None;
-                }
-            }
-        }
-        LeaseEffect::Release => {
-            let released_at = next.next_timestamp();
-            if let Some(lease_id) = req.record.lease_id.as_ref() {
-                if let Some(lease) = next.leases.get_mut(lease_id.as_str()) {
-                    if release_reason_for(req.record.kind) == LeaseReleaseReason::Expired {
-                        lease.expires_at = Some(released_at);
-                    }
-                    lease.released_at = Some(released_at);
-                    lease.release_reason = Some(release_reason_for(req.record.kind));
-                }
-            }
-        }
-        LeaseEffect::None => {}
-    }
-
-    if let Some(snapshot) = req.decision.next_snapshot.clone() {
-        next.snapshots.insert(snapshot.work_id.0.clone(), snapshot);
-    }
-
-    if let Some(session) = req.session.clone() {
-        next.sessions.insert(
-            session_key_parts(&session.agent_id, &session.work_id),
-            session,
-        );
-    }
-
-    let work_id = req.record.work_id.clone();
-    let snapshot = next.snapshots.get(work_id.as_str()).cloned();
-    let lease = snapshot
-        .as_ref()
-        .and_then(|item| item.active_lease_id.as_ref())
-        .and_then(|lease_id| next.leases.get(lease_id.as_str()))
-        .cloned()
-        .filter(|item| item.released_at.is_none());
-    let pending_wake = next.pending_wakes.get(work_id.as_str()).cloned();
-    let session = req.session.clone();
-
-    Ok(CommitDecisionRes {
-        snapshot,
-        lease,
-        pending_wake,
-        session,
-        activity_event: Some(activity_event.view),
-    })
 }
 
 fn acquire_claim_lease(
@@ -2042,10 +1846,10 @@ fn claim_actor_agent_id(
 #[cfg(test)]
 mod tests {
     use crate::model::{
-        ActorId, ActorKind, BillingKind, ConsumptionUsage, ContractSetId, DecisionOutcome,
-        EvidenceBundle, EvidenceInline, EvidenceRef, GateResult, GateSpec, LeaseEffect,
-        PendingWakeEffect, ProofHint, ProofHintKind, RecordId, RuntimeKind, SessionId, TaskSession,
-        TransitionDecision, TransitionKind, TransitionRecord, WorkKind, WorkPatch,
+        workspace_fingerprint, ActorId, ActorKind, BillingKind, ConsumptionUsage, ContractSetId,
+        DecisionOutcome, EvidenceBundle, EvidenceInline, EvidenceRef, GateResult, GateSpec,
+        LeaseEffect, PendingWakeEffect, ProofHint, ProofHintKind, RecordId, RuntimeKind, SessionId,
+        TaskSession, TransitionDecision, TransitionKind, TransitionRecord, WorkKind, WorkPatch,
     };
 
     use super::*;
@@ -2188,6 +1992,7 @@ mod tests {
             .create_company(CreateCompanyReq {
                 name: "Scenario Labs".to_owned(),
                 description: "http onboarding".to_owned(),
+                runtime_hard_stop_cents: None,
             })
             .expect("company create should succeed");
         let rules = store.read_contracts().rules;
@@ -2252,6 +2057,7 @@ mod tests {
             .create_company(CreateCompanyReq {
                 name: "Foreign Runtime".to_owned(),
                 description: "secondary company".to_owned(),
+                runtime_hard_stop_cents: None,
             })
             .expect("company create should succeed");
         let rules = store.read_contracts().rules;
@@ -2398,7 +2204,7 @@ mod tests {
 
         assert_eq!(run.work_id, WorkId::from(DEMO_TODO_WORK_ID));
         assert_eq!(run.agent_id, AgentId::from(DEMO_AGENT_ID));
-        assert_eq!(run.status, RunLifecycle::Running);
+        assert_eq!(run.status, RunStatus::Running);
     }
 
     #[test]
@@ -2411,7 +2217,7 @@ mod tests {
                 company_id: CompanyId::from(DEMO_COMPANY_ID),
                 agent_id: AgentId::from(DEMO_AGENT_ID),
                 work_id: WorkId::from(DEMO_TODO_WORK_ID),
-                status: RunLifecycle::Queued,
+                status: RunStatus::Queued,
                 created_at: SystemTime::UNIX_EPOCH,
                 updated_at: SystemTime::UNIX_EPOCH,
             },
@@ -2433,7 +2239,7 @@ mod tests {
             .expect("queued run should remain stored");
 
         assert_eq!(claimed.lease.run_id, Some(RunId::from("run-queued")));
-        assert_eq!(run.status, RunLifecycle::Running);
+        assert_eq!(run.status, RunStatus::Running);
         assert_eq!(run.agent_id, AgentId::from(DEMO_AGENT_ID));
     }
 
@@ -2490,8 +2296,40 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(runnable_runs.len(), 1);
-        assert_eq!(runnable_runs[0].status, RunLifecycle::Queued);
+        assert_eq!(runnable_runs[0].status, RunStatus::Queued);
         assert_eq!(runnable_runs[0].agent_id, AgentId::from(DEMO_AGENT_ID));
+    }
+
+    #[test]
+    fn merge_wake_for_paused_agent_keeps_pending_wake_without_creating_run() {
+        let store = MemoryStore::demo();
+        store
+            .set_agent_status(SetAgentStatusReq {
+                agent_id: AgentId::from(DEMO_AGENT_ID),
+                status: AgentStatus::Paused,
+            })
+            .expect("pause should succeed");
+
+        let merged = store
+            .merge_wake(merge_wake_req(
+                DEMO_TODO_WORK_ID,
+                "paused agent wake",
+                &["cargo test"],
+            ))
+            .expect("wake merge should succeed");
+
+        let state = store.state.borrow();
+        let runnable_runs = state
+            .runs
+            .values()
+            .filter(|run| {
+                run.work_id == WorkId::from(DEMO_TODO_WORK_ID) && run.status.is_runnable()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(merged.count, 1);
+        assert!(state.pending_wakes.contains_key(DEMO_TODO_WORK_ID));
+        assert!(runnable_runs.is_empty());
     }
 
     #[test]
@@ -2563,17 +2401,26 @@ mod tests {
             .leases
             .get(DEMO_LEASE_ID)
             .expect("lease should remain stored");
+        let timeout_record = state
+            .transition_records
+            .iter()
+            .find(|record| record.kind == TransitionKind::TimeoutRequeue)
+            .expect("timeout record should persist");
         let snapshot = state
             .snapshots
             .get(DEMO_DOING_WORK_ID)
             .expect("work snapshot should remain stored");
 
-        assert_eq!(failed_run.status, RunLifecycle::Failed);
-        assert_eq!(follow_up.status, RunLifecycle::Queued);
+        assert_eq!(failed_run.status, RunStatus::TimedOut);
+        assert_eq!(follow_up.status, RunStatus::Queued);
         assert_eq!(follow_up.work_id, WorkId::from(DEMO_DOING_WORK_ID));
         assert_eq!(lease.release_reason, Some(LeaseReleaseReason::Expired));
         assert!(lease.released_at.is_some());
         assert!(lease.expires_at.is_some());
+        assert_eq!(timeout_record.actor_kind, ActorKind::System);
+        assert_eq!(timeout_record.actor_id, ActorId::from("system"));
+        assert_eq!(timeout_record.before_status, WorkStatus::Doing);
+        assert_eq!(timeout_record.after_status, Some(WorkStatus::Todo));
         assert_eq!(snapshot.status, WorkStatus::Todo);
         assert_eq!(snapshot.active_lease_id, None);
         assert_eq!(snapshot.assignee_agent_id, None);
@@ -2613,7 +2460,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        assert_eq!(failed_run.status, RunLifecycle::Failed);
+        assert_eq!(failed_run.status, RunStatus::TimedOut);
         assert!(runnable_runs.is_empty());
     }
 
@@ -2645,6 +2492,7 @@ mod tests {
                 runtime: RuntimeKind::Coclai,
                 runtime_session_id: "runtime-queued".to_owned(),
                 cwd: "/repo".to_owned(),
+                workspace_fingerprint: workspace_fingerprint("/repo"),
                 contract_rev: 2,
                 last_record_id: None,
                 last_decision_summary: Some("queued session".to_owned()),
@@ -2737,6 +2585,7 @@ mod tests {
                 runtime: RuntimeKind::Coclai,
                 runtime_session_id: "runtime-running".to_owned(),
                 cwd: "/repo".to_owned(),
+                workspace_fingerprint: workspace_fingerprint("/repo"),
                 contract_rev: 2,
                 last_record_id: None,
                 last_decision_summary: Some("running session".to_owned()),
@@ -2818,8 +2667,12 @@ mod tests {
             work_id: WorkId::from(DEMO_DOING_WORK_ID),
             actor_kind: ActorKind::Agent,
             actor_id: ActorId::from(DEMO_AGENT_ID),
+            run_id: None,
+            session_id: None,
             lease_id: Some(LeaseId::from(DEMO_LEASE_ID)),
             expected_rev,
+            contract_set_id: ContractSetId::from(DEMO_CONTRACT_SET_ID),
+            contract_rev: 1,
             before_status: WorkStatus::Doing,
             after_status: None,
             outcome: rejected.outcome,
@@ -2839,11 +2692,7 @@ mod tests {
             happened_at: SystemTime::UNIX_EPOCH + Duration::from_secs(40),
         };
         store
-            .commit_decision(CommitDecisionReq {
-                record,
-                decision: rejected,
-                session: None,
-            })
+            .commit_decision(CommitDecisionReq::new(rejected, record, None))
             .expect("rejected decision should persist record");
 
         let board = store.read_board();
@@ -2864,6 +2713,91 @@ mod tests {
             .failed_gates
             .iter()
             .any(|detail| detail == "all pending obligations must be resolved"));
+    }
+
+    #[test]
+    fn read_models_project_transition_record_details_into_board_and_work_audit() {
+        let store = MemoryStore::demo();
+        let expected_rev = store
+            .load_context(&WorkId::from(DEMO_DOING_WORK_ID))
+            .expect("context should load")
+            .snapshot
+            .rev;
+        let rejected = TransitionDecision {
+            outcome: DecisionOutcome::Rejected,
+            reasons: vec![crate::model::ReasonCode::GateFailed],
+            next_snapshot: None,
+            lease_effect: LeaseEffect::Keep,
+            pending_wake_effect: PendingWakeEffect::Retain,
+            gate_results: vec![GateResult {
+                gate: GateSpec::AllRequiredObligationsResolved,
+                passed: false,
+                detail: "all pending obligations must be resolved".to_owned(),
+            }],
+            evidence: EvidenceBundle::default(),
+            summary: "gate denied completion".to_owned(),
+        };
+        let record = crate::model::TransitionRecord {
+            record_id: RecordId::from("record-transition-projection"),
+            company_id: CompanyId::from(DEMO_COMPANY_ID),
+            work_id: WorkId::from(DEMO_DOING_WORK_ID),
+            actor_kind: ActorKind::Agent,
+            actor_id: ActorId::from(DEMO_AGENT_ID),
+            run_id: None,
+            session_id: None,
+            lease_id: Some(LeaseId::from(DEMO_LEASE_ID)),
+            expected_rev,
+            contract_set_id: ContractSetId::from(DEMO_CONTRACT_SET_ID),
+            contract_rev: 1,
+            before_status: WorkStatus::Doing,
+            after_status: None,
+            outcome: rejected.outcome,
+            reasons: rejected.reasons.clone(),
+            kind: TransitionKind::Complete,
+            patch: crate::model::WorkPatch {
+                summary: "attempt complete".to_owned(),
+                resolved_obligations: Vec::new(),
+                declared_risks: Vec::new(),
+            },
+            gate_results: rejected.gate_results.clone(),
+            evidence: rejected.evidence.clone(),
+            evidence_inline: Some(crate::model::EvidenceInline {
+                summary: "gate denied completion".to_owned(),
+            }),
+            evidence_refs: Vec::new(),
+            happened_at: SystemTime::UNIX_EPOCH + Duration::from_secs(41),
+        };
+        store
+            .commit_decision(CommitDecisionReq::new(rejected, record, None))
+            .expect("rejected decision should persist record");
+
+        let board = store.read_board();
+        let work = store
+            .read_work(Some(&WorkId::from(DEMO_DOING_WORK_ID)))
+            .expect("work read should succeed");
+
+        assert_eq!(
+            board.recent_transition_records[0],
+            "record-transition-projection"
+        );
+        assert_eq!(board.recent_transition_details.len(), 1);
+        assert_eq!(
+            board.recent_transition_details[0].record_id,
+            "record-transition-projection"
+        );
+        assert_eq!(board.recent_transition_details[0].kind, "complete");
+        assert_eq!(board.recent_transition_details[0].outcome, "rejected");
+        assert_eq!(
+            board.recent_transition_details[0].summary,
+            "gate denied completion"
+        );
+        assert!(work.items[0].audit_entries.iter().any(|entry| {
+            entry.event_kind == "transition"
+                && entry.summary == "gate denied completion"
+                && entry.outcome.as_deref() == Some("rejected")
+                && entry.before_status == Some(WorkStatus::Doing)
+                && entry.after_status.is_none()
+        }));
     }
 
     #[test]
@@ -2971,11 +2905,12 @@ mod tests {
             runtime: RuntimeKind::Coclai,
             runtime_session_id: "runtime-1".to_owned(),
             cwd: "/repo".to_owned(),
+            workspace_fingerprint: workspace_fingerprint("/repo"),
             contract_rev: context.contract.revision,
             last_record_id: Some(RecordId::from("record-1")),
             last_decision_summary: Some(decision.summary.clone()),
             last_gate_summary: None,
-            updated_at: SystemTime::UNIX_EPOCH + Duration::from_secs(20),
+            updated_at: SystemTime::UNIX_EPOCH,
         };
         let record = TransitionRecord {
             record_id: RecordId::from("record-1"),
@@ -2983,8 +2918,12 @@ mod tests {
             work_id: WorkId::from(DEMO_DOING_WORK_ID),
             actor_kind: ActorKind::Agent,
             actor_id: ActorId::from(DEMO_AGENT_ID),
+            run_id: None,
+            session_id: Some(session.session_id.clone()),
             lease_id: Some(LeaseId::from(DEMO_LEASE_ID)),
             expected_rev: context.snapshot.rev,
+            contract_set_id: context.snapshot.contract_set_id.clone(),
+            contract_rev: context.snapshot.contract_rev,
             before_status: context.snapshot.status,
             after_status: decision
                 .next_snapshot
@@ -3004,28 +2943,39 @@ mod tests {
                 summary: decision.summary.clone(),
             }),
             evidence_refs: Vec::<EvidenceRef>::new(),
-            happened_at: SystemTime::UNIX_EPOCH + Duration::from_secs(21),
+            happened_at: SystemTime::UNIX_EPOCH,
         };
 
         let result = store
-            .commit_decision(CommitDecisionReq {
-                decision: TransitionDecision {
+            .commit_decision(CommitDecisionReq::new(
+                TransitionDecision {
                     pending_wake_effect: PendingWakeEffect::Clear,
                     lease_effect: LeaseEffect::Release,
                     ..decision.clone()
                 },
                 record,
-                session: Some(session.clone()),
-            })
+                Some(session.clone()),
+            ))
             .expect("commit_decision should succeed");
 
         assert_eq!(
-            result.snapshot.expect("snapshot should persist").status,
+            result
+                .snapshot
+                .as_ref()
+                .expect("snapshot should persist")
+                .status,
             WorkStatus::Blocked
         );
         assert!(result.pending_wake.is_none());
         assert!(result.lease.is_none());
-        assert_eq!(result.session, Some(session));
+        assert_ne!(
+            result
+                .session
+                .as_ref()
+                .expect("session should persist")
+                .updated_at,
+            session.updated_at
+        );
         assert_eq!(
             result
                 .activity_event
@@ -3033,6 +2983,83 @@ mod tests {
                 .summary,
             "Block Accepted with next status Blocked"
         );
+
+        let state = store.state.borrow();
+        let persisted_record = state
+            .transition_records
+            .iter()
+            .find(|item| item.record_id == RecordId::from("record-1"))
+            .expect("record should persist");
+        let persisted_snapshot = state
+            .snapshots
+            .get(DEMO_DOING_WORK_ID)
+            .expect("snapshot should persist");
+        let persisted_session = state
+            .sessions
+            .get(&session_key_parts(
+                &AgentId::from(DEMO_AGENT_ID),
+                &WorkId::from(DEMO_DOING_WORK_ID),
+            ))
+            .expect("session should persist");
+
+        assert_ne!(persisted_record.happened_at, SystemTime::UNIX_EPOCH);
+        assert_eq!(
+            persisted_record
+                .session_id
+                .as_ref()
+                .map(|session| session.as_str()),
+            Some("session-1")
+        );
+        assert_eq!(persisted_record.run_id, None);
+        assert_eq!(persisted_snapshot.updated_at, persisted_record.happened_at);
+        assert_eq!(persisted_session.updated_at, persisted_record.happened_at);
+    }
+
+    #[test]
+    fn memory_commit_stage_helpers_match_surreal_stage_names() {
+        let memory_src = include_str!("store/commit.rs");
+        let surreal_src = include_str!("../surreal/store/commit.rs");
+
+        for helper in [
+            "load_commit_authoritative_state(",
+            "prepare_commit_decision(",
+            "load_commit_decision_result(",
+        ] {
+            assert!(memory_src.contains(helper));
+            assert!(surreal_src.contains(helper));
+        }
+        assert!(memory_src.contains("execute_commit_decision_apply("));
+        assert!(surreal_src.contains("execute_commit_decision_transaction("));
+    }
+
+    #[test]
+    fn memory_commit_apply_appends_record_before_projection_updates() {
+        let src = include_str!("store/commit.rs");
+        let record_push = src
+            .find("next.transition_records.push(req.context.record.clone());")
+            .expect("record append should exist");
+        let activity_push = src
+            .find("next.activity_events.push(activity_event.clone());")
+            .expect("activity append should exist");
+        let snapshot_apply = src
+            .find("if let Some(snapshot) = req.decision.next_snapshot.clone()")
+            .expect("snapshot apply should exist");
+        let session_apply = src
+            .find("if let Some(session) = req.effects.session.clone()")
+            .expect("session apply should exist");
+
+        assert!(record_push < snapshot_apply);
+        assert!(activity_push < snapshot_apply);
+        assert!(record_push < session_apply);
+        assert!(activity_push < session_apply);
+    }
+
+    #[test]
+    fn memory_direct_claim_and_commit_acquire_share_same_helper() {
+        let store_src = include_str!("store.rs");
+        let commit_src = include_str!("store/commit.rs");
+        assert!(store_src.contains("let lease = acquire_claim_lease("));
+        assert!(commit_src.contains("let _ = acquire_claim_lease("));
     }
 
     #[test]
@@ -3050,15 +3077,20 @@ mod tests {
         };
 
         let error = store
-            .commit_decision(CommitDecisionReq {
-                record: TransitionRecord {
+            .commit_decision(CommitDecisionReq::new(
+                rejected,
+                TransitionRecord {
                     record_id: RecordId::from("record-stale-rev"),
                     company_id: CompanyId::from(DEMO_COMPANY_ID),
                     work_id: WorkId::from(DEMO_DOING_WORK_ID),
                     actor_kind: ActorKind::Agent,
                     actor_id: ActorId::from(DEMO_AGENT_ID),
+                    run_id: None,
+                    session_id: None,
                     lease_id: Some(LeaseId::from(DEMO_LEASE_ID)),
                     expected_rev: 999,
+                    contract_set_id: ContractSetId::from(DEMO_CONTRACT_SET_ID),
+                    contract_rev: 1,
                     before_status: WorkStatus::Doing,
                     after_status: None,
                     outcome: DecisionOutcome::Rejected,
@@ -3077,9 +3109,8 @@ mod tests {
                     evidence_refs: Vec::<EvidenceRef>::new(),
                     happened_at: SystemTime::UNIX_EPOCH + Duration::from_secs(50),
                 },
-                decision: rejected,
-                session: None,
-            })
+                None,
+            ))
             .expect_err("stale expected_rev should conflict");
 
         assert_eq!(error.kind, StoreErrorKind::Conflict);
@@ -3107,15 +3138,20 @@ mod tests {
         };
 
         let error = store
-            .commit_decision(CommitDecisionReq {
-                record: TransitionRecord {
+            .commit_decision(CommitDecisionReq::new(
+                rejected,
+                TransitionRecord {
                     record_id: RecordId::from("record-stale-lease"),
                     company_id: CompanyId::from(DEMO_COMPANY_ID),
                     work_id: WorkId::from(DEMO_DOING_WORK_ID),
                     actor_kind: ActorKind::Agent,
                     actor_id: ActorId::from(DEMO_AGENT_ID),
+                    run_id: None,
+                    session_id: None,
                     lease_id: Some(LeaseId::from("lease-missing")),
                     expected_rev: 1,
+                    contract_set_id: ContractSetId::from(DEMO_CONTRACT_SET_ID),
+                    contract_rev: 1,
                     before_status: WorkStatus::Doing,
                     after_status: None,
                     outcome: DecisionOutcome::Rejected,
@@ -3134,9 +3170,8 @@ mod tests {
                     evidence_refs: Vec::<EvidenceRef>::new(),
                     happened_at: SystemTime::UNIX_EPOCH + Duration::from_secs(51),
                 },
-                decision: rejected,
-                session: None,
-            })
+                None,
+            ))
             .expect_err("stale lease should conflict");
 
         assert_eq!(error.kind, StoreErrorKind::Conflict);
@@ -3168,15 +3203,20 @@ mod tests {
         };
 
         store
-            .commit_decision(CommitDecisionReq {
-                record: TransitionRecord {
+            .commit_decision(CommitDecisionReq::new(
+                decision.clone(),
+                TransitionRecord {
                     record_id: RecordId::from("record-reasons"),
                     company_id: CompanyId::from(DEMO_COMPANY_ID),
                     work_id: WorkId::from(DEMO_DOING_WORK_ID),
                     actor_kind: ActorKind::Agent,
                     actor_id: ActorId::from(DEMO_AGENT_ID),
+                    run_id: None,
+                    session_id: None,
                     lease_id: Some(LeaseId::from(DEMO_LEASE_ID)),
                     expected_rev: 1,
+                    contract_set_id: ContractSetId::from(DEMO_CONTRACT_SET_ID),
+                    contract_rev: 1,
                     before_status: WorkStatus::Doing,
                     after_status: None,
                     outcome: DecisionOutcome::Rejected,
@@ -3195,9 +3235,8 @@ mod tests {
                     evidence_refs: Vec::new(),
                     happened_at: SystemTime::UNIX_EPOCH + Duration::from_secs(52),
                 },
-                decision,
-                session: None,
-            })
+                None,
+            ))
             .expect("rejected decision should persist");
 
         let stored = store
@@ -3239,6 +3278,14 @@ mod tests {
             .get(DEMO_DOING_WORK_ID)
             .cloned()
             .expect("live snapshot should exist");
+        let pending_wake = state
+            .pending_wakes
+            .get(DEMO_DOING_WORK_ID)
+            .expect("pending wake should remain retained");
+        let follow_up_run = state
+            .runs
+            .get("run-2")
+            .expect("follow-up queued run should persist");
         let replay_records = state
             .transition_records
             .iter()
@@ -3251,6 +3298,8 @@ mod tests {
         let replayed = crate::kernel::replay_snapshot_from_records(&before, &replay_records)
             .expect("timeout replay should succeed");
 
+        assert_eq!(pending_wake.count, 1);
+        assert_eq!(follow_up_run.status, RunStatus::Queued);
         assert_eq!(replayed, live);
     }
 }

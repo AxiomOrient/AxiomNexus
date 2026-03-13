@@ -195,7 +195,9 @@ mod tests {
     use super::serve_listener;
     use crate::{
         adapter::http::{dto::WORK_WAKE_ROUTE, transport::HttpTransport},
-        adapter::memory::store::DEMO_TODO_WORK_ID,
+        adapter::memory::store::{
+            DEMO_AGENT_ID, DEMO_DOING_WORK_ID, DEMO_LEASE_ID, DEMO_TODO_WORK_ID,
+        },
     };
 
     #[test]
@@ -297,6 +299,62 @@ mod tests {
         assert!(sse_response.starts_with("HTTP/1.1 200 OK"));
         assert!(sse_response.contains("Content-Type: text/event-stream"));
         assert!(sse_response.contains("\"data\":\"wake merged 1\""));
+
+        server.join().expect("server should join");
+    }
+
+    #[test]
+    fn serve_does_not_stream_failed_write_attempts_over_sse() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let addr = listener.local_addr().expect("local addr should exist");
+
+        let server = thread::spawn(move || {
+            let transport = HttpTransport::new(MemoryStore::demo());
+            serve_listener(listener, transport, Some(2))
+                .expect("server should serve sse + failed intent");
+        });
+
+        let sse_reader = thread::spawn(move || {
+            let mut stream = TcpStream::connect(addr).expect("sse client should connect");
+            write!(
+                stream,
+                "GET /api/events HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"
+            )
+            .expect("sse request should write");
+            stream
+                .shutdown(std::net::Shutdown::Write)
+                .expect("sse write half should close");
+            let mut response = String::new();
+            stream
+                .read_to_string(&mut response)
+                .expect("sse response should read");
+            response
+        });
+
+        thread::sleep(Duration::from_millis(50));
+        let body = format!(
+            "{{\"work_id\":\"{work_id}\",\"agent_id\":\"{agent_id}\",\"lease_id\":\"{lease_id}\",\"expected_rev\":0,\"kind\":\"propose_progress\",\"patch\":{{\"summary\":\"stale turn\",\"resolved_obligations\":[],\"declared_risks\":[]}},\"note\":null,\"proof_hints\":[]}}",
+            work_id = DEMO_DOING_WORK_ID,
+            agent_id = DEMO_AGENT_ID,
+            lease_id = DEMO_LEASE_ID,
+        );
+        let failed_response = send_request(
+            addr,
+            &format!(
+                "POST /api/work/{}/intents HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                DEMO_DOING_WORK_ID,
+                body.len(),
+                body
+            ),
+        );
+
+        let sse_response = sse_reader.join().expect("sse client should join");
+
+        assert!(failed_response.starts_with("HTTP/1.1 409 Conflict"));
+        assert!(sse_response.starts_with("HTTP/1.1 200 OK"));
+        assert!(sse_response.contains("Content-Type: text/event-stream"));
+        assert!(!sse_response.contains("data: "));
+        assert!(!sse_response.contains("\"data\":"));
 
         server.join().expect("server should join");
     }

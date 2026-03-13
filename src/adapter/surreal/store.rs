@@ -1,3 +1,6 @@
+mod commit;
+mod query;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -20,9 +23,9 @@ use crate::{
     model::{
         ActorKind, AgentId, AgentStatus, BillingKind, CompanyId, CompanyProfile, ContractSet,
         ContractSetId, ContractSetStatus, DecisionOutcome, LeaseEffect, LeaseId,
-        LeaseReleaseReason, PendingWake, Priority, RunId, RuntimeKind, SessionId, TaskSession,
-        Timestamp, TransitionKind, TransitionRecord, WorkId, WorkKind, WorkLease, WorkSnapshot,
-        WorkStatus,
+        LeaseReleaseReason, PendingWake, Priority, RunId, RunStatus, RuntimeKind, SessionId,
+        TaskSession, Timestamp, TransitionKind, TransitionRecord, WorkId, WorkKind, WorkLease,
+        WorkSnapshot, WorkStatus,
     },
     port::store::{
         ActivateContractReq, ActivateContractRes, ActivityEntryView, ActivityReadModel,
@@ -95,6 +98,9 @@ struct CompanyDoc {
     company_id: String,
     name: String,
     description: String,
+    runtime_hard_stop_cents: Option<u64>,
+    #[serde(default)]
+    recorded_estimated_cost_cents: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, SurrealValue)]
@@ -213,6 +219,7 @@ struct SessionDoc {
     runtime: String,
     runtime_session_id: String,
     cwd: String,
+    workspace_fingerprint: String,
     contract_rev: u32,
     last_record_id: Option<String>,
     last_decision_summary: Option<String>,
@@ -253,8 +260,12 @@ struct TransitionRecordDoc {
     work_id: String,
     actor_kind: String,
     actor_id: String,
+    run_id: Option<String>,
+    session_id: Option<String>,
     lease_id: Option<String>,
     expected_rev: u64,
+    contract_set_id: String,
+    contract_rev: u32,
     before_status: String,
     after_status: Option<String>,
     outcome: String,
@@ -548,6 +559,8 @@ impl SurrealStore {
                 company_id: DEMO_COMPANY_ID.to_owned(),
                 name: "AxiomNexus Demo".to_owned(),
                 description: "demo company".to_owned(),
+                runtime_hard_stop_cents: None,
+                recorded_estimated_cost_cents: Some(0),
             },
         )?;
         self.upsert_record(
@@ -634,7 +647,7 @@ impl SurrealStore {
                 company_id: DEMO_COMPANY_ID.to_owned(),
                 agent_id: DEMO_AGENT_ID.to_owned(),
                 work_id: DEMO_DOING_WORK_ID.to_owned(),
-                status: run_status_label(RunLifecycle::Running).to_owned(),
+                status: run_status_label(RunStatus::Running).to_owned(),
                 created_at_secs: 1,
                 updated_at_secs: 1,
             },
@@ -1007,6 +1020,8 @@ impl StorePort for SurrealStore {
                 company_id: CompanyId::from(sequenced_id(meta.next_company_seq)),
                 name: req.name,
                 description: req.description,
+                runtime_hard_stop_cents: req.runtime_hard_stop_cents,
+                recorded_estimated_cost_cents: 0,
             }
         })?;
 
@@ -1016,6 +1031,8 @@ impl StorePort for SurrealStore {
                 company_id: profile.company_id.to_string(),
                 name: profile.name.clone(),
                 description: profile.description.clone(),
+                runtime_hard_stop_cents: profile.runtime_hard_stop_cents,
+                recorded_estimated_cost_cents: Some(profile.recorded_estimated_cost_cents),
             },
         )?;
 
@@ -1251,6 +1268,10 @@ impl StorePort for SurrealStore {
         })
     }
 
+    fn claim_lease(&self, req: ClaimLeaseReq) -> Result<ClaimLeaseRes, StoreError> {
+        SurrealStore::claim_lease(self, req)
+    }
+
     fn load_context(&self, work_id: &WorkId) -> Result<WorkContext, StoreError> {
         let snapshot_doc = self
             .select_record::<WorkDoc>(&work_record_id(work_id.as_str()))?
@@ -1279,6 +1300,30 @@ impl StorePort for SurrealStore {
             pending_wake,
             contract,
         })
+    }
+
+    fn list_work_snapshots(&self) -> Result<Vec<WorkSnapshot>, StoreError> {
+        let mut snapshots = self
+            .select_table::<WorkDoc>("work")?
+            .into_iter()
+            .map(WorkDoc::into_snapshot)
+            .collect::<Result<Vec<_>, _>>()?;
+        snapshots.sort_by(|left, right| left.work_id.cmp(&right.work_id));
+        Ok(snapshots)
+    }
+
+    fn load_transition_records(
+        &self,
+        work_id: &WorkId,
+    ) -> Result<Vec<TransitionRecord>, StoreError> {
+        self.query_docs_with_bind::<TransitionRecordDoc, _>(
+            "SELECT * FROM transition_record WHERE work_id = $work_id ORDER BY expected_rev ASC, happened_at_secs ASC, record_id ASC",
+            "work_id",
+            work_id.as_str().to_owned(),
+        )?
+        .into_iter()
+        .map(TransitionRecordDoc::into_model)
+        .collect()
     }
 
     fn merge_wake(&self, req: MergeWakeReq) -> Result<crate::model::PendingWake, StoreError> {
@@ -1328,14 +1373,14 @@ impl StorePort for SurrealStore {
         })?;
         let stale_runs = self.query_docs_with_binds::<RunDoc, _, _>(
             "SELECT * FROM run WHERE status = $status AND updated_at_secs <= $cutoff ORDER BY updated_at_secs ASC",
-            ("status", run_status_label(RunLifecycle::Running).to_owned()),
+            ("status", run_status_label(RunStatus::Running).to_owned()),
             ("cutoff", reaped_at_secs.saturating_sub(timeout.as_secs())),
         )?;
 
         let mut reaped = Vec::new();
         for stale_run in stale_runs {
             let failed_run = RunDoc {
-                status: run_status_label(RunLifecycle::Failed).to_owned(),
+                status: run_status_label(RunStatus::TimedOut).to_owned(),
                 updated_at_secs: reaped_at_secs,
                 ..stale_run.clone()
             };
@@ -1398,10 +1443,23 @@ impl StorePort for SurrealStore {
             "SELECT * FROM run WHERE status = 'queued' ORDER BY created_at_secs ASC",
         )?;
         let agents = self.query_docs::<AgentDoc>("SELECT * FROM agent")?;
+        let companies = self.query_docs::<CompanyDoc>("SELECT * FROM company")?;
         let agent_statuses = agents
             .into_iter()
             .map(|agent| (agent.agent_id, parse_agent_status(&agent.status)))
             .collect::<Vec<_>>();
+        let company_budget_state = companies
+            .into_iter()
+            .map(|company| {
+                (
+                    company.company_id,
+                    (
+                        company.runtime_hard_stop_cents,
+                        company.recorded_estimated_cost_cents.unwrap_or(0),
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
 
         Ok(runs
             .into_iter()
@@ -1411,6 +1469,12 @@ impl StorePort for SurrealStore {
                     .iter()
                     .find(|(agent_id, _)| agent_id == &run.agent_id)
                     .and_then(|(_, status)| status.as_ref().ok().copied()),
+                budget_blocked: company_budget_hard_stopped_from_rollup(
+                    company_budget_state
+                        .get(run.company_id.as_str())
+                        .copied()
+                        .unwrap_or((None, 0)),
+                ),
                 created_at: timestamp(run.created_at_secs),
             })
             .collect())
@@ -1492,9 +1556,9 @@ impl StorePort for SurrealStore {
             meta.tick
         })?;
 
-        let should_record_activity = run.status != run_status_label(RunLifecycle::Running);
+        let should_record_activity = run.status != run_status_label(RunStatus::Running);
         let running = RunDoc {
-            status: run_status_label(RunLifecycle::Running).to_owned(),
+            status: run_status_label(RunStatus::Running).to_owned(),
             updated_at_secs,
             ..run
         };
@@ -1503,6 +1567,64 @@ impl StorePort for SurrealStore {
         if should_record_activity {
             self.persist_run_activity(&running)?;
         }
+
+        Ok(())
+    }
+
+    fn mark_run_completed(&self, run_id: &crate::model::RunId) -> Result<(), StoreError> {
+        let run = self
+            .select_record::<RunDoc>(&run_record_id(run_id.as_str()))?
+            .ok_or_else(|| not_found("mark_run_completed", run_id.as_str()))?;
+
+        if !parse_run_status(&run.status)?.is_runnable() {
+            return Err(conflict(
+                "mark_run_completed requires a queued or running run",
+            ));
+        }
+
+        let updated_at_secs = self.update_store_meta(|meta| {
+            meta.tick += 1;
+            meta.tick
+        })?;
+
+        let completed = RunDoc {
+            status: run_status_label(RunStatus::Completed).to_owned(),
+            updated_at_secs,
+            ..run
+        };
+
+        self.upsert_record(&run_record_id(run_id.as_str()), completed.clone())?;
+        self.persist_run_completion_activity(&completed)?;
+
+        Ok(())
+    }
+
+    fn mark_run_failed(
+        &self,
+        run_id: &crate::model::RunId,
+        reason: &str,
+    ) -> Result<(), StoreError> {
+        let run = self
+            .select_record::<RunDoc>(&run_record_id(run_id.as_str()))?
+            .ok_or_else(|| not_found("mark_run_failed", run_id.as_str()))?;
+
+        if !parse_run_status(&run.status)?.is_runnable() {
+            return Err(conflict("mark_run_failed requires a queued or running run"));
+        }
+
+        let updated_at_secs = self.update_store_meta(|meta| {
+            meta.tick += 1;
+            meta.tick
+        })?;
+
+        let failed = RunDoc {
+            status: run_status_label(RunStatus::Failed).to_owned(),
+            updated_at_secs,
+            ..run
+        };
+
+        self.upsert_record(&run_record_id(run_id.as_str()), failed.clone())?;
+        self.persist_run_failure_activity(&failed, reason)?;
 
         Ok(())
     }
@@ -1532,6 +1654,9 @@ impl StorePort for SurrealStore {
                 "record_consumption rejects company/run or agent/run boundary violations",
             ));
         }
+        let company = self
+            .select_record::<CompanyDoc>(&company_record_id(&run.company_id))?
+            .ok_or_else(|| not_found("record_consumption company", &run.company_id))?;
 
         let (event_id, created_at_secs) = self.update_store_meta(|meta| {
             meta.next_consumption_seq += 1;
@@ -1556,6 +1681,16 @@ impl StorePort for SurrealStore {
                 estimated_cost_cents: req.usage.estimated_cost_cents,
                 created_at_secs,
             },
+        )?;
+        self.upsert_record(
+            &company_record_id(req.company_id.as_str()),
+            CompanyDoc {
+                recorded_estimated_cost_cents: Some(
+                    company.recorded_estimated_cost_cents.unwrap_or(0)
+                        + req.usage.estimated_cost_cents.unwrap_or(0),
+                ),
+                ..company
+            },
         )
     }
 
@@ -1564,592 +1699,38 @@ impl StorePort for SurrealStore {
             .commit_lock
             .lock()
             .map_err(|_| unavailable("surreal commit lock is poisoned"))?;
-        let snapshot = self
-            .select_record::<WorkDoc>(&work_record_id(req.record.work_id.as_str()))?
-            .ok_or_else(|| not_found("commit_decision", req.record.work_id.as_str()))?;
-        let live_lease = match req.record.lease_id.as_ref() {
-            Some(lease_id) => self
-                .select_record::<LeaseDoc>(&lease_record_id(lease_id.as_str()))?
-                .filter(|lease| lease.released_at_secs.is_none()),
-            None => None,
-        };
-        ensure_commit_preconditions(&snapshot, live_lease.as_ref(), &req)?;
-
-        let transition_doc = TransitionRecordDoc::from_model(&req.record)?;
-        let activity_doc = ActivityEventDoc::from_transition_record(&req.record);
-        let claim_acquire = match req.decision.lease_effect {
-            LeaseEffect::Acquire => {
-                let lease_id = req.record.lease_id.as_ref().ok_or_else(|| {
-                    conflict("commit_decision acquire requires a lease_id on the record")
-                })?;
-                let agent_id = claim_actor_agent_id(&req.record, "commit_decision")?;
-                Some(prepare_claim_acquire(
-                    self,
-                    &snapshot,
-                    &agent_id,
-                    lease_id,
-                    timestamp_secs(req.record.happened_at),
-                    "commit_decision",
-                )?)
-            }
-            _ => None,
-        };
-
-        let lease_doc = match req.decision.lease_effect {
-            LeaseEffect::Acquire => claim_acquire
-                .as_ref()
-                .map(|prepared| LeaseDoc::from_model(&prepared.lease)),
-            LeaseEffect::Keep | LeaseEffect::Renew => live_lease.clone().map(|lease| LeaseDoc {
-                released_at_secs: None,
-                release_reason: None,
-                ..lease
-            }),
-            LeaseEffect::Release => live_lease.clone().map(|lease| LeaseDoc {
-                expires_at_secs: (release_reason_for(req.record.kind)
-                    == LeaseReleaseReason::Expired)
-                    .then(|| timestamp_secs(req.record.happened_at)),
-                released_at_secs: Some(timestamp_secs(req.record.happened_at)),
-                release_reason: Some(
-                    lease_release_reason_label(release_reason_for(req.record.kind)).to_owned(),
-                ),
-                ..lease
-            }),
-            LeaseEffect::None => None,
-        };
-
-        let snapshot_doc = req
-            .decision
-            .next_snapshot
-            .as_ref()
-            .map(WorkDoc::from_snapshot);
-        let session_doc = req.session.as_ref().map(SessionDoc::from_model);
-
-        let lease_id = req.record.lease_id.as_ref().map(ToString::to_string);
-        let session_key = req.session.as_ref().map(|session| {
-            session_record_id_parts(session.agent_id.as_str(), session.work_id.as_str())
-        });
-        let work_id = req.record.work_id.to_string();
-        let pending_wake_id = req.record.work_id.to_string();
-        let run_doc = claim_acquire.as_ref().map(|prepared| prepared.run.clone());
-        let run_activity_doc = claim_acquire
-            .as_ref()
-            .and_then(|prepared| prepared.run_activity.clone());
-        self.runtime.block_on(async {
-            let mut query = String::from("BEGIN TRANSACTION;\n");
-            query.push_str(
-                "UPSERT type::record('transition_record', $transition_id) CONTENT $transition_doc;\n",
-            );
-            query.push_str(
-                "UPSERT type::record('activity_event', $activity_id) CONTENT $activity_doc;\n",
-            );
-            if run_doc.is_some() {
-                query.push_str("UPSERT type::record('run', $run_id) CONTENT $run_doc;\n");
-            }
-            if run_activity_doc.is_some() {
-                query.push_str(
-                    "UPSERT type::record('activity_event', $run_activity_id) CONTENT $run_activity_doc;\n",
-                );
-            }
-
-            if snapshot_doc.is_some() {
-                query.push_str("UPSERT type::record('work', $work_id) CONTENT $work_doc;\n");
-            }
-            if req.record.lease_id.is_some() && lease_doc.is_some() {
-                query.push_str("UPSERT type::record('lease', $lease_id) CONTENT $lease_doc;\n");
-            }
-            if matches!(
-                req.decision.pending_wake_effect,
-                crate::model::PendingWakeEffect::Clear
-            ) {
-                query.push_str("DELETE type::record('pending_wake', $pending_wake_id);\n");
-            }
-            if session_doc.is_some() {
-                query.push_str(
-                    "UPSERT type::record('task_session', $session_key) CONTENT $session_doc;\n",
-                );
-            }
-            query.push_str("COMMIT TRANSACTION;");
-
-            let mut request = self
-                .db
-                .query(query)
-                .bind(("transition_id", req.record.record_id.to_string()))
-                .bind(("transition_doc", transition_doc))
-                .bind(("activity_id", activity_doc.event_id.clone()))
-                .bind(("activity_doc", activity_doc.clone()));
-            if let Some(run_doc) = run_doc {
-                let run_id = run_doc.run_id.clone();
-                request = request.bind(("run_id", run_id)).bind(("run_doc", run_doc));
-            }
-            if let Some(run_activity_doc) = run_activity_doc {
-                let run_activity_id = run_activity_doc.event_id.clone();
-                request = request
-                    .bind(("run_activity_id", run_activity_id))
-                    .bind(("run_activity_doc", run_activity_doc));
-            }
-
-            if let Some(work_doc) = snapshot_doc {
-                request = request.bind(("work_id", work_id)).bind(("work_doc", work_doc));
-            }
-            if let Some(lease_doc) = lease_doc {
-                if let Some(lease_id) = lease_id {
-                    request = request
-                        .bind(("lease_id", lease_id))
-                        .bind(("lease_doc", lease_doc));
-                }
-            }
-            if matches!(
-                req.decision.pending_wake_effect,
-                crate::model::PendingWakeEffect::Clear
-            ) {
-                request = request.bind(("pending_wake_id", pending_wake_id));
-            }
-            if let Some(session_doc) = session_doc {
-                if let Some(session_key) = session_key {
-                    request = request
-                        .bind(("session_key", session_key))
-                        .bind(("session_doc", session_doc));
-                }
-            }
-
-            request
-                .await
-                .map_err(|error| unavailable(&format!("surreal commit_decision failed: {error}")))?
-                .check()
-                .map_err(|error| unavailable(&format!("surreal commit_decision check failed: {error}")))?;
-            Ok::<(), StoreError>(())
-        })?;
-
-        let snapshot = self
-            .select_record::<WorkDoc>(&work_record_id(req.record.work_id.as_str()))?
-            .map(WorkDoc::into_snapshot)
-            .transpose()?;
-        let lease = snapshot
-            .as_ref()
-            .and_then(|item| item.active_lease_id.as_ref())
-            .and_then(|lease_id| {
-                self.select_record::<LeaseDoc>(&lease_record_id(lease_id.as_str()))
-                    .ok()
-            })
-            .flatten()
-            .filter(|item| item.released_at_secs.is_none())
-            .map(LeaseDoc::into_model)
-            .transpose()?;
-        let pending_wake = self
-            .select_record::<PendingWakeDoc>(&pending_wake_record_id(req.record.work_id.as_str()))?
-            .map(PendingWakeDoc::into_model)
-            .transpose()?;
-
-        Ok(CommitDecisionRes {
-            snapshot,
-            lease,
-            pending_wake,
-            session: req.session,
-            activity_event: Some(activity_doc.into_view()?),
-        })
+        let authoritative = commit::load_commit_authoritative_state(self, &req)?;
+        let prepared = commit::prepare_commit_decision(self, req, authoritative)?;
+        commit::execute_commit_decision_transaction(self, &prepared)?;
+        commit::load_commit_decision_result(self, prepared)
     }
 
     fn read_board(&self) -> BoardReadModel {
-        let runs = self
-            .query_docs_with_bind::<RunDoc, _>(
-                "SELECT * FROM run WHERE status = $status ORDER BY updated_at_secs DESC",
-                "status",
-                run_status_label(RunLifecycle::Running).to_owned(),
-            )
-            .unwrap_or_default();
-        let leases = self
-            .query_docs::<LeaseRunDoc>(
-                "SELECT lease_id, run_id, work_id, agent_id, released_at_secs FROM lease",
-            )
-            .unwrap_or_default();
-        let pending_wakes = self
-            .select_table::<PendingWakeDoc>("pending_wake")
-            .unwrap_or_default();
-        let blocked_work = self
-            .query_docs_with_bind::<WorkDoc, _>(
-                "SELECT * FROM work WHERE status = $status ORDER BY updated_at_secs DESC",
-                "status",
-                work_status_label(WorkStatus::Blocked).to_owned(),
-            )
-            .unwrap_or_default();
-        let recent_records = self
-            .query_docs::<TransitionRecordDoc>(
-                "SELECT * FROM transition_record ORDER BY happened_at_secs DESC LIMIT 5",
-            )
-            .unwrap_or_default();
-        let recent_failure_candidates = self
-            .query_docs::<TransitionRecordDoc>(
-                "SELECT * FROM transition_record ORDER BY happened_at_secs DESC LIMIT 100",
-            )
-            .unwrap_or_default();
-        let consumption = self
-            .query_docs::<ConsumptionAgentDoc>(
-                "SELECT agent_id, input_tokens, output_tokens, run_seconds, estimated_cost_cents FROM consumption_event",
-            )
-            .unwrap_or_default();
-
-        let running_runs = runs
-            .iter()
-            .filter(|run| run.status == run_status_label(RunLifecycle::Running))
-            .map(|run| RunningRunView {
-                run_id: run.run_id.clone(),
-                agent_id: run.agent_id.clone(),
-                work_id: run.work_id.clone(),
-                lease_id: leases
-                    .iter()
-                    .find(|lease| {
-                        lease.released_at_secs.is_none()
-                            && lease.run_id.as_deref() == Some(run.run_id.as_str())
-                            && lease.work_id == run.work_id
-                            && lease.agent_id == run.agent_id
-                    })
-                    .map(|lease| lease.lease_id.clone()),
-            })
-            .collect::<Vec<_>>();
-        let running_agents = running_runs
-            .iter()
-            .map(|run| run.agent_id.clone())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let recent_gate_failure_details = recent_failure_candidates
-            .iter()
-            .filter(|record| record.outcome == "rejected" || !record.failed_gates.is_empty())
-            .take(5)
-            .map(|record| {
-                store_support::board_gate_failure_detail(
-                    record.record_id.clone(),
-                    record.work_id.clone(),
-                    record.outcome.clone(),
-                    record.failed_gates.clone(),
-                )
-            })
-            .collect::<Vec<_>>();
-
-        BoardReadModel {
-            running_agents,
-            running_runs,
-            pending_wakes: pending_wakes
-                .iter()
-                .map(|wake| wake.work_id.clone())
-                .collect(),
-            pending_wake_details: pending_wakes
-                .iter()
-                .map(|wake| PendingWakeSummaryView {
-                    work_id: wake.work_id.clone(),
-                    count: wake.count,
-                    latest_reason: wake.latest_reason.clone(),
-                    obligations: wake.obligations.clone(),
-                })
-                .collect(),
-            blocked_work: blocked_work
-                .iter()
-                .map(|snapshot| snapshot.work_id.clone())
-                .collect(),
-            recent_transition_records: recent_records
-                .iter()
-                .map(|record| record.record_id.clone())
-                .collect(),
-            recent_transition_details: recent_records
-                .iter()
-                .map(|record| {
-                    store_support::board_transition_detail(
-                        record.record_id.clone(),
-                        record.work_id.clone(),
-                        record.kind.clone(),
-                        record.outcome.clone(),
-                        record
-                            .evidence_summary
-                            .clone()
-                            .unwrap_or_else(|| record.patch_summary.clone()),
-                    )
-                })
-                .collect(),
-            recent_gate_failures: recent_gate_failure_details
-                .iter()
-                .map(|detail| detail.record_id.clone())
-                .collect(),
-            recent_gate_failure_details,
-            consumption_summary: summarized_consumption(&consumption),
-        }
+        query::read_board(self)
     }
 
     fn read_companies(&self) -> CompanyReadModel {
-        let companies = self
-            .select_table::<CompanyDoc>("company")
-            .unwrap_or_default();
-        let agent_company_ids = self
-            .query_docs::<CompanyKeyDoc>("SELECT company_id FROM agent")
-            .unwrap_or_default();
-        let work_company_ids = self
-            .query_docs::<CompanyKeyDoc>("SELECT company_id FROM work")
-            .unwrap_or_default();
-        let active_contracts = self
-            .query_docs_with_bind::<ActiveContractDoc, _>(
-                "SELECT company_id, contract_set_id, revision FROM contract_revision WHERE status = $status",
-                "status",
-                contract_status_label(ContractSetStatus::Active).to_owned(),
-            )
-            .unwrap_or_default()
-            .into_iter()
-            .map(|contract| (contract.company_id.clone(), contract))
-            .collect::<BTreeMap<_, _>>();
-        let agent_counts = count_by_key(
-            agent_company_ids
-                .iter()
-                .map(|agent| agent.company_id.as_str()),
-        );
-        let work_counts =
-            count_by_key(work_company_ids.iter().map(|work| work.company_id.as_str()));
-
-        CompanyReadModel {
-            items: companies
-                .into_iter()
-                .map(|company| {
-                    let active_contract = active_contracts.get(company.company_id.as_str());
-                    CompanySummaryView {
-                        company_id: company.company_id.clone(),
-                        name: company.name,
-                        description: company.description,
-                        active_contract_set_id: active_contract
-                            .map(|contract| contract.contract_set_id.clone()),
-                        active_contract_revision: active_contract.map(|contract| contract.revision),
-                        agent_count: agent_counts
-                            .get(company.company_id.as_str())
-                            .copied()
-                            .unwrap_or_default(),
-                        work_count: work_counts
-                            .get(company.company_id.as_str())
-                            .copied()
-                            .unwrap_or_default(),
-                    }
-                })
-                .collect(),
-        }
+        query::read_companies(self)
     }
 
     fn read_work(&self, work_id: Option<&WorkId>) -> Result<WorkReadModel, StoreError> {
-        if let Some(work_id) = work_id {
-            let doc = self
-                .select_record::<WorkDoc>(&work_record_id(work_id.as_str()))?
-                .ok_or_else(|| not_found("read_work", work_id.as_str()))?;
-            let contract = contract_for_work(self, &doc).ok();
-            let pending_obligations = self
-                .select_record::<PendingWakeDoc>(&pending_wake_record_id(work_id.as_str()))?
-                .map(|wake| wake.obligations)
-                .unwrap_or_default();
-            let comments = work_comments_for(self, work_id.as_str())?;
-            let audit_entries = work_activity_entries(self, work_id.as_str())?;
-
-            return Ok(WorkReadModel {
-                items: vec![WorkSummary {
-                    work_id: doc.work_id.clone(),
-                    parent_id: doc.parent_id.clone(),
-                    kind: parse_work_kind(&doc.kind).unwrap_or(WorkKind::Task),
-                    title: doc.title.clone(),
-                    body: doc.body.clone(),
-                    status: parse_work_status(&doc.status).unwrap_or(WorkStatus::Backlog),
-                    rev: doc.rev,
-                    active_lease_id: doc.active_lease_id.clone(),
-                    contract_set_id: doc.contract_set_id.clone(),
-                    contract_rev: doc.contract_rev,
-                    contract_name: contract.as_ref().map(|contract| contract.name.clone()),
-                    contract_status: contract.as_ref().map(|contract| contract.status),
-                    pending_obligations,
-                    comments,
-                    audit_entries,
-                }],
-            });
-        }
-
-        let docs = self.select_table::<WorkDoc>("work")?;
-        let contracts = self.select_table::<ContractRevisionDoc>("contract_revision")?;
-        let contract_index = contracts
-            .iter()
-            .map(|contract| {
-                (
-                    (contract.contract_set_id.as_str(), contract.revision),
-                    contract,
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        let filtered = docs;
-        let pending_wakes = self
-            .select_table::<PendingWakeDoc>("pending_wake")?
-            .into_iter()
-            .map(|wake| (wake.work_id, wake.obligations))
-            .collect::<BTreeMap<_, _>>();
-        let comments_by_work = grouped_work_comments(self.query_docs::<WorkCommentDoc>(
-            "SELECT * FROM work_comment ORDER BY created_at_secs ASC",
-        )?)?;
-        let activity_by_work = grouped_work_activity_entries(
-            self.select_table::<ActivityEventDoc>("activity_event")?,
-        )?;
-
-        Ok(WorkReadModel {
-            items: filtered
-                .into_iter()
-                .map(|doc| {
-                    let contract = contract_index
-                        .get(&(doc.contract_set_id.as_str(), doc.contract_rev))
-                        .copied();
-                    WorkSummary {
-                        work_id: doc.work_id.clone(),
-                        parent_id: doc.parent_id.clone(),
-                        kind: parse_work_kind(&doc.kind).unwrap_or(WorkKind::Task),
-                        title: doc.title.clone(),
-                        body: doc.body.clone(),
-                        status: parse_work_status(&doc.status).unwrap_or(WorkStatus::Backlog),
-                        rev: doc.rev,
-                        active_lease_id: doc.active_lease_id.clone(),
-                        contract_set_id: doc.contract_set_id.clone(),
-                        contract_rev: doc.contract_rev,
-                        contract_name: contract.map(|contract| contract.name.clone()),
-                        contract_status: contract
-                            .and_then(|contract| parse_contract_status(&contract.status).ok()),
-                        pending_obligations: pending_wakes
-                            .get(&doc.work_id)
-                            .cloned()
-                            .unwrap_or_default(),
-                        comments: comments_by_work
-                            .get(&doc.work_id)
-                            .cloned()
-                            .unwrap_or_default(),
-                        audit_entries: activity_by_work
-                            .get(&doc.work_id)
-                            .cloned()
-                            .unwrap_or_default(),
-                    }
-                })
-                .collect(),
-        })
+        query::read_work(self, work_id)
     }
 
     fn read_agents(&self) -> AgentReadModel {
-        let lease_agents = self
-            .query_docs::<LeaseAgentDoc>("SELECT agent_id, released_at_secs FROM lease")
-            .unwrap_or_default();
-        let agents = self.select_table::<AgentDoc>("agent").unwrap_or_default();
-        let runs = self
-            .query_docs::<RunDoc>("SELECT * FROM run ORDER BY updated_at_secs DESC LIMIT 10")
-            .unwrap_or_default();
-        let sessions = self
-            .query_docs::<SessionDoc>("SELECT * FROM task_session ORDER BY updated_at_secs DESC")
-            .unwrap_or_default();
-        let consumption = self
-            .query_docs::<ConsumptionAgentDoc>(
-                "SELECT agent_id, input_tokens, output_tokens, run_seconds, estimated_cost_cents FROM consumption_event",
-            )
-            .unwrap_or_default();
-
-        AgentReadModel {
-            active_agents: lease_agents
-                .iter()
-                .filter(|lease| lease.released_at_secs.is_none())
-                .map(|lease| lease.agent_id.clone())
-                .collect(),
-            registered_agents: agents
-                .iter()
-                .filter_map(|agent| {
-                    Some(AgentSummaryView {
-                        agent_id: agent.agent_id.clone(),
-                        company_id: agent.company_id.clone(),
-                        name: agent.name.clone(),
-                        role: agent.role.clone(),
-                        status: parse_agent_status(&agent.status).ok()?,
-                    })
-                })
-                .collect(),
-            recent_runs: runs
-                .into_iter()
-                .map(|run| AgentRunView {
-                    run_id: run.run_id,
-                    agent_id: run.agent_id,
-                    work_id: run.work_id,
-                    status: run.status,
-                })
-                .collect(),
-            current_sessions: sessions
-                .into_iter()
-                .filter_map(|session| {
-                    Some(AgentSessionSummaryView {
-                        agent_id: session.agent_id,
-                        work_id: session.work_id,
-                        runtime: parse_runtime_kind(&session.runtime).ok()?,
-                        runtime_session_id: session.runtime_session_id,
-                        cwd: session.cwd,
-                        contract_rev: session.contract_rev,
-                        last_decision_summary: session.last_decision_summary,
-                        last_gate_summary: session.last_gate_summary,
-                    })
-                })
-                .collect(),
-            consumption_by_agent: agent_consumption_summaries(&agents, &consumption),
-        }
+        query::read_agents(self)
     }
 
     fn read_activity(&self) -> ActivityReadModel {
-        ActivityReadModel {
-            entries: activity_entries(self).unwrap_or_default(),
-        }
+        query::read_activity(self)
     }
 
     fn read_run(&self, run_id: &crate::model::RunId) -> Result<RunReadModel, StoreError> {
-        let run = self
-            .select_record::<RunDoc>(&run_record_id(run_id.as_str()))?
-            .ok_or_else(|| not_found("read_run", run_id.as_str()))?;
-        let current_session = self
-            .select_record::<SessionDoc>(&session_record_id_parts(&run.agent_id, &run.work_id))?
-            .map(SessionDoc::into_agent_session_summary)
-            .transpose()?;
-
-        Ok(RunReadModel {
-            run_id: run.run_id,
-            agent_id: run.agent_id,
-            work_id: run.work_id,
-            status: run.status,
-            current_session,
-        })
+        query::read_run(self, run_id)
     }
 
     fn read_contracts(&self) -> ContractsReadModel {
-        let mut contracts = self
-            .select_table::<ContractRevisionDoc>("contract_revision")
-            .unwrap_or_default();
-        contracts.sort_by_key(|contract| contract.revision);
-
-        let selected = contracts
-            .iter()
-            .find(|contract| contract.status == contract_status_label(ContractSetStatus::Active))
-            .or_else(|| contracts.last());
-
-        if let Some(contract) = selected {
-            ContractsReadModel {
-                contract_set_id: contract.contract_set_id.clone(),
-                name: contract.name.clone(),
-                revision: contract.revision,
-                status: parse_contract_status(&contract.status).unwrap_or(ContractSetStatus::Draft),
-                revisions: contracts
-                    .iter()
-                    .map(|contract| ContractRevisionView {
-                        revision: contract.revision,
-                        status: parse_contract_status(&contract.status)
-                            .unwrap_or(ContractSetStatus::Draft),
-                        name: contract.name.clone(),
-                    })
-                    .collect(),
-                rules: serde_json::from_value(contract.rules_json.clone()).unwrap_or_default(),
-            }
-        } else {
-            ContractsReadModel {
-                contract_set_id: String::new(),
-                name: String::new(),
-                revision: 0,
-                status: ContractSetStatus::Draft,
-                revisions: Vec::new(),
-                rules: Vec::new(),
-            }
-        }
+        query::read_contracts(self)
     }
 }
 
@@ -2263,6 +1844,7 @@ impl SessionDoc {
             runtime: runtime_kind_label(session.runtime).to_owned(),
             runtime_session_id: session.runtime_session_id.clone(),
             cwd: session.cwd.clone(),
+            workspace_fingerprint: session.workspace_fingerprint.clone(),
             contract_rev: session.contract_rev,
             last_record_id: session.last_record_id.as_ref().map(ToString::to_string),
             last_decision_summary: session.last_decision_summary.clone(),
@@ -2280,6 +1862,7 @@ impl SessionDoc {
             runtime: parse_runtime_kind(&self.runtime)?,
             runtime_session_id: self.runtime_session_id,
             cwd: self.cwd,
+            workspace_fingerprint: self.workspace_fingerprint,
             contract_rev: self.contract_rev,
             last_record_id: self.last_record_id.map(crate::model::RecordId::from),
             last_decision_summary: self.last_decision_summary,
@@ -2312,8 +1895,12 @@ impl TransitionRecordDoc {
             work_id: record.work_id.to_string(),
             actor_kind: actor_kind_label(record.actor_kind).to_owned(),
             actor_id: record.actor_id.to_string(),
+            run_id: record.run_id.as_ref().map(ToString::to_string),
+            session_id: record.session_id.as_ref().map(ToString::to_string),
             lease_id: record.lease_id.as_ref().map(ToString::to_string),
             expected_rev: record.expected_rev,
+            contract_set_id: record.contract_set_id.to_string(),
+            contract_rev: record.contract_rev,
             before_status: work_status_label(record.before_status).to_owned(),
             after_status: record
                 .after_status
@@ -2337,6 +1924,47 @@ impl TransitionRecordDoc {
             evidence_refs_json: serde_json::to_value(&record.evidence_refs)
                 .map_err(|error| unavailable(&format!("evidence ref encode failed: {error}")))?,
             happened_at_secs: timestamp_secs(record.happened_at),
+        })
+    }
+
+    fn into_model(self) -> Result<TransitionRecord, StoreError> {
+        Ok(TransitionRecord {
+            record_id: crate::model::RecordId::from(self.record_id),
+            company_id: CompanyId::from(self.company_id),
+            work_id: WorkId::from(self.work_id),
+            actor_kind: parse_actor_kind(&self.actor_kind)?,
+            actor_id: crate::model::ActorId::from(self.actor_id),
+            run_id: self.run_id.map(RunId::from),
+            session_id: self.session_id.map(SessionId::from),
+            lease_id: self.lease_id.map(LeaseId::from),
+            expected_rev: self.expected_rev,
+            contract_set_id: ContractSetId::from(self.contract_set_id),
+            contract_rev: self.contract_rev,
+            before_status: parse_work_status(&self.before_status)?,
+            after_status: self
+                .after_status
+                .as_deref()
+                .map(parse_work_status)
+                .transpose()?,
+            outcome: parse_decision_outcome(&self.outcome)?,
+            reasons: serde_json::from_value(self.reasons_json)
+                .map_err(|error| unavailable(&format!("reason decode failed: {error}")))?,
+            kind: parse_transition_kind(&self.kind)?,
+            patch: crate::model::WorkPatch {
+                summary: self.patch_summary,
+                resolved_obligations: self.resolved_obligations,
+                declared_risks: self.declared_risks,
+            },
+            gate_results: serde_json::from_value(self.gate_results_json)
+                .map_err(|error| unavailable(&format!("gate result decode failed: {error}")))?,
+            evidence: serde_json::from_value(self.evidence_json)
+                .map_err(|error| unavailable(&format!("evidence decode failed: {error}")))?,
+            evidence_inline: self
+                .evidence_summary
+                .map(|summary| crate::model::EvidenceInline { summary }),
+            evidence_refs: serde_json::from_value(self.evidence_refs_json)
+                .map_err(|error| unavailable(&format!("evidence ref decode failed: {error}")))?,
+            happened_at: timestamp(self.happened_at_secs),
         })
     }
 }
@@ -2397,6 +2025,42 @@ impl ActivityEventDoc {
             before_status: None,
             after_status: None,
             outcome: None,
+            evidence_summary: None,
+            happened_at_secs: run.updated_at_secs,
+            priority: 1,
+        }
+    }
+
+    fn from_run_failure(run: &RunDoc, reason: &str) -> Self {
+        Self {
+            event_id: format!("{}-failed-{}", run.run_id, run.updated_at_secs),
+            work_id: run.work_id.clone(),
+            event_kind: "run".to_owned(),
+            summary: format!("run {} failed: {reason}", run.run_id),
+            actor_kind: None,
+            actor_id: None,
+            source: Some("runtime".to_owned()),
+            before_status: None,
+            after_status: None,
+            outcome: Some("failed".to_owned()),
+            evidence_summary: None,
+            happened_at_secs: run.updated_at_secs,
+            priority: 1,
+        }
+    }
+
+    fn from_run_completion(run: &RunDoc) -> Self {
+        Self {
+            event_id: format!("{}-completed-{}", run.run_id, run.updated_at_secs),
+            work_id: run.work_id.clone(),
+            event_kind: "run".to_owned(),
+            summary: format!("run {} completed", run.run_id),
+            actor_kind: None,
+            actor_id: None,
+            source: Some("runtime".to_owned()),
+            before_status: None,
+            after_status: None,
+            outcome: Some("completed".to_owned()),
             evidence_summary: None,
             happened_at_secs: run.updated_at_secs,
             priority: 1,
@@ -2480,6 +2144,16 @@ impl SurrealStore {
         self.upsert_record(&activity_event_record_id(&event.event_id), event)
     }
 
+    fn persist_run_failure_activity(&self, run: &RunDoc, reason: &str) -> Result<(), StoreError> {
+        let event = ActivityEventDoc::from_run_failure(run, reason);
+        self.upsert_record(&activity_event_record_id(&event.event_id), event)
+    }
+
+    fn persist_run_completion_activity(&self, run: &RunDoc) -> Result<(), StoreError> {
+        let event = ActivityEventDoc::from_run_completion(run);
+        self.upsert_record(&activity_event_record_id(&event.event_id), event)
+    }
+
     fn ensure_runnable_run(
         &self,
         snapshot: &WorkDoc,
@@ -2498,12 +2172,12 @@ impl SurrealStore {
             let previous_status = run.status.clone();
             let next = RunDoc {
                 agent_id: agent_id.to_string(),
-                status: run_status_label(RunLifecycle::Running).to_owned(),
+                status: run_status_label(RunStatus::Running).to_owned(),
                 updated_at_secs,
                 ..run
             };
             self.upsert_record(&run_record_id(&next.run_id), next.clone())?;
-            if previous_status != run_status_label(RunLifecycle::Running) {
+            if previous_status != run_status_label(RunStatus::Running) {
                 self.persist_run_activity(&next)?;
             }
             return Ok(Some(next));
@@ -2518,7 +2192,7 @@ impl SurrealStore {
             company_id: snapshot.company_id.clone(),
             agent_id: agent_id.to_string(),
             work_id: snapshot.work_id.clone(),
-            status: run_status_label(RunLifecycle::Running).to_owned(),
+            status: run_status_label(RunStatus::Running).to_owned(),
             created_at_secs: updated_at_secs,
             updated_at_secs,
         };
@@ -2581,7 +2255,7 @@ impl SurrealStore {
                     company_id: snapshot.company_id.clone(),
                     agent_id,
                     work_id: snapshot.work_id.clone(),
-                    status: run_status_label(RunLifecycle::Queued).to_owned(),
+                    status: run_status_label(RunStatus::Queued).to_owned(),
                     created_at_secs: updated_at_secs,
                     updated_at_secs,
                 };
@@ -2639,21 +2313,6 @@ impl SurrealStore {
             .find(|agent| agent.company_id == snapshot.company_id)
             .map(|agent| agent.agent_id)
             .ok_or_else(|| conflict("no runnable agent is available for wake queue"))
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RunLifecycle {
-    Queued,
-    Running,
-    Succeeded,
-    Failed,
-    Cancelled,
-}
-
-impl RunLifecycle {
-    fn is_runnable(self) -> bool {
-        matches!(self, Self::Queued | Self::Running)
     }
 }
 
@@ -2938,6 +2597,10 @@ fn consumption_summary(events: &[ConsumptionEventDoc]) -> ConsumptionSummaryView
     summary
 }
 
+fn company_budget_hard_stopped_from_rollup((limit, spent): (Option<u64>, u64)) -> bool {
+    limit.is_some_and(|limit| spent >= limit)
+}
+
 fn summarized_consumption(events: &[ConsumptionAgentDoc]) -> ConsumptionSummaryView {
     let mut summary = ConsumptionSummaryView {
         total_turns: 0,
@@ -3217,23 +2880,25 @@ fn transition_kind_label(kind: TransitionKind) -> &'static str {
     }
 }
 
-fn run_status_label(status: RunLifecycle) -> &'static str {
+fn run_status_label(status: RunStatus) -> &'static str {
     match status {
-        RunLifecycle::Queued => "queued",
-        RunLifecycle::Running => "running",
-        RunLifecycle::Succeeded => "succeeded",
-        RunLifecycle::Failed => "failed",
-        RunLifecycle::Cancelled => "cancelled",
+        RunStatus::Queued => "queued",
+        RunStatus::Running => "running",
+        RunStatus::Completed => "completed",
+        RunStatus::Failed => "failed",
+        RunStatus::Cancelled => "cancelled",
+        RunStatus::TimedOut => "timed_out",
     }
 }
 
-fn parse_run_status(status: &str) -> Result<RunLifecycle, StoreError> {
+fn parse_run_status(status: &str) -> Result<RunStatus, StoreError> {
     match status {
-        "queued" => Ok(RunLifecycle::Queued),
-        "running" => Ok(RunLifecycle::Running),
-        "succeeded" => Ok(RunLifecycle::Succeeded),
-        "failed" => Ok(RunLifecycle::Failed),
-        "cancelled" => Ok(RunLifecycle::Cancelled),
+        "queued" => Ok(RunStatus::Queued),
+        "running" => Ok(RunStatus::Running),
+        "completed" => Ok(RunStatus::Completed),
+        "failed" => Ok(RunStatus::Failed),
+        "cancelled" => Ok(RunStatus::Cancelled),
+        "timed_out" => Ok(RunStatus::TimedOut),
         _ => Err(unavailable("unknown run status in surreal document")),
     }
 }
@@ -3346,15 +3011,15 @@ fn ensure_commit_preconditions(
     live_lease: Option<&LeaseDoc>,
     req: &CommitDecisionReq,
 ) -> Result<(), StoreError> {
-    if snapshot.rev != req.record.expected_rev {
+    if snapshot.rev != req.context.record.expected_rev {
         return Err(conflict(
             "commit_decision expected_rev does not match authoritative snapshot",
         ));
     }
 
-    match req.decision.lease_effect {
+    match req.effects.lease {
         LeaseEffect::Acquire => {
-            if req.record.lease_id.is_none() {
+            if req.context.record.lease_id.is_none() {
                 return Err(conflict(
                     "commit_decision acquire requires a lease_id on the record",
                 ));
@@ -3366,7 +3031,7 @@ fn ensure_commit_preconditions(
             }
         }
         LeaseEffect::Keep | LeaseEffect::Renew | LeaseEffect::Release | LeaseEffect::None => {
-            let Some(lease_id) = req.record.lease_id.as_ref() else {
+            let Some(lease_id) = req.context.record.lease_id.as_ref() else {
                 return Ok(());
             };
             if live_lease.is_none() {
@@ -3478,11 +3143,11 @@ fn prepare_runnable_run_for_claim(
         let previous_status = run.status.clone();
         let next = RunDoc {
             agent_id: agent_id.to_string(),
-            status: run_status_label(RunLifecycle::Running).to_owned(),
+            status: run_status_label(RunStatus::Running).to_owned(),
             updated_at_secs,
             ..run
         };
-        let run_activity = (previous_status != run_status_label(RunLifecycle::Running))
+        let run_activity = (previous_status != run_status_label(RunStatus::Running))
             .then(|| ActivityEventDoc::from_run(&next));
         return Ok((next, run_activity));
     }
@@ -3496,7 +3161,7 @@ fn prepare_runnable_run_for_claim(
         company_id: snapshot.company_id.clone(),
         agent_id: agent_id.to_string(),
         work_id: snapshot.work_id.clone(),
-        status: run_status_label(RunLifecycle::Running).to_owned(),
+        status: run_status_label(RunStatus::Running).to_owned(),
         created_at_secs: updated_at_secs,
         updated_at_secs,
     };
@@ -3600,11 +3265,12 @@ mod tests {
     use crate::{
         adapter::memory::store::{DEMO_COMPANY_ID, DEMO_DOING_WORK_ID},
         model::{
-            ActorId, ActorKind, AgentId, AgentStatus, CompanyId, ContractSetId, ContractSetStatus,
-            DecisionOutcome, EvidenceBundle, EvidenceInline, EvidenceRef, GateResult, GateSpec,
-            LeaseEffect, LeaseId, PendingWakeEffect, RecordId, RunId, RuntimeKind, SessionId,
-            TaskSession, TransitionDecision, TransitionKind, TransitionRecord, TransitionRule,
-            WorkId, WorkKind, WorkPatch, WorkSnapshot, WorkStatus,
+            workspace_fingerprint, ActorId, ActorKind, AgentId, AgentStatus, CompanyId,
+            ContractSetId, ContractSetStatus, DecisionOutcome, EvidenceBundle, EvidenceInline,
+            EvidenceRef, GateResult, GateSpec, LeaseEffect, LeaseId, PendingWakeEffect, RecordId,
+            RunId, RuntimeKind, SessionId, TaskSession, TransitionDecision, TransitionKind,
+            TransitionRecord, TransitionRule, WorkId, WorkKind, WorkPatch, WorkSnapshot,
+            WorkStatus,
         },
         port::store::{
             ActivateContractReq, AppendCommentReq, ClaimLeaseReq, CommitDecisionReq,
@@ -3763,6 +3429,7 @@ mod tests {
             .create_company(CreateCompanyReq {
                 name: "Acme".to_owned(),
                 description: "release scope".to_owned(),
+                runtime_hard_stop_cents: None,
             })
             .expect("company should create");
         let agent = store
@@ -3790,6 +3457,7 @@ mod tests {
             .create_company(CreateCompanyReq {
                 name: "Acme".to_owned(),
                 description: "release scope".to_owned(),
+                runtime_hard_stop_cents: None,
             })
             .expect("company should create");
 
@@ -3849,6 +3517,7 @@ mod tests {
             .create_company(CreateCompanyReq {
                 name: "Acme".to_owned(),
                 description: "release scope".to_owned(),
+                runtime_hard_stop_cents: None,
             })
             .expect("company should create");
         let draft = store
@@ -3911,6 +3580,7 @@ mod tests {
             runtime: RuntimeKind::Coclai,
             runtime_session_id: "runtime-1".to_owned(),
             cwd: "/repo".to_owned(),
+            workspace_fingerprint: workspace_fingerprint("/repo"),
             contract_rev: 1,
             last_record_id: None,
             last_decision_summary: Some("accepted".to_owned()),
@@ -3956,6 +3626,7 @@ mod tests {
                 runtime: RuntimeKind::Coclai,
                 runtime_session_id: "runtime-1".to_owned(),
                 cwd: "/repo".to_owned(),
+                workspace_fingerprint: workspace_fingerprint("/repo"),
                 contract_rev: 1,
                 last_record_id: None,
                 last_decision_summary: Some("running".to_owned()),
@@ -4077,6 +3748,7 @@ mod tests {
             .create_company(CreateCompanyReq {
                 name: "Acme".to_owned(),
                 description: "release scope".to_owned(),
+                runtime_hard_stop_cents: None,
             })
             .expect("company should create");
         let draft = store
@@ -4131,6 +3803,95 @@ mod tests {
                 .latest_reason,
             "gate failed"
         );
+    }
+
+    #[test]
+    fn load_queued_runs_marks_company_budget_hard_stop_candidates() {
+        let store = new_store("queued-budget");
+        let company = store
+            .create_company(CreateCompanyReq {
+                name: "Budget Co".to_owned(),
+                description: "company hard stop".to_owned(),
+                runtime_hard_stop_cents: Some(5),
+            })
+            .expect("company should create");
+        let draft = store
+            .create_contract_draft(CreateContractDraftReq {
+                company_id: company.profile.company_id.clone(),
+                name: "budget-contract".to_owned(),
+                rules: rules(),
+            })
+            .expect("draft should create");
+        store
+            .activate_contract(ActivateContractReq {
+                company_id: company.profile.company_id.clone(),
+                revision: draft.revision,
+            })
+            .expect("activation should succeed");
+        let contract_set_id = store
+            .read_companies()
+            .items
+            .into_iter()
+            .find(|item| item.company_id == company.profile.company_id.as_str())
+            .and_then(|item| item.active_contract_set_id)
+            .expect("company should expose active contract");
+        let agent = store
+            .create_agent(CreateAgentReq {
+                company_id: company.profile.company_id.clone(),
+                name: "worker".to_owned(),
+                role: "builder".to_owned(),
+            })
+            .expect("agent should create");
+        let work = store
+            .create_work(CreateWorkReq {
+                company_id: company.profile.company_id.clone(),
+                parent_id: None,
+                kind: WorkKind::Task,
+                title: "Blocked work".to_owned(),
+                body: "budget hard stop".to_owned(),
+                contract_set_id: ContractSetId::from(contract_set_id),
+            })
+            .expect("work should create");
+        store
+            .merge_wake(MergeWakeReq {
+                work_id: work.snapshot.work_id.clone(),
+                actor_kind: ActorKind::Board,
+                actor_id: ActorId::from("board"),
+                source: "manual".to_owned(),
+                reason: "budget".to_owned(),
+                obligations: vec!["stay queued".to_owned()],
+            })
+            .expect("wake should queue a run");
+
+        let queued_run = store
+            .load_queued_runs()
+            .expect("queued runs should load")
+            .into_iter()
+            .find(|candidate| candidate.agent_status == Some(AgentStatus::Active))
+            .expect("queued run should exist");
+        store
+            .record_consumption(RecordConsumptionReq {
+                company_id: company.profile.company_id.clone(),
+                agent_id: agent.agent_id.clone(),
+                run_id: queued_run.run_id.clone(),
+                billing_kind: crate::model::BillingKind::Api,
+                usage: crate::model::ConsumptionUsage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    run_seconds: 1,
+                    estimated_cost_cents: Some(5),
+                },
+            })
+            .expect("consumption should persist");
+
+        let blocked_run = store
+            .load_queued_runs()
+            .expect("queued runs should load")
+            .into_iter()
+            .find(|candidate| candidate.run_id == queued_run.run_id)
+            .expect("queued run should remain listed");
+
+        assert!(blocked_run.budget_blocked);
     }
 
     #[test]
@@ -4306,6 +4067,121 @@ mod tests {
     }
 
     #[test]
+    fn merge_wake_persists_coalesced_pending_wake() {
+        let store = new_store("wake-coalesce");
+        let seeded = seed_runtime_work(&store);
+
+        let merged = store
+            .merge_wake(merge_wake_req(
+                seeded.work_id.as_str(),
+                "gate failed",
+                &["run tests", "run fmt"],
+            ))
+            .expect("first wake merge should succeed");
+        let merged_again = store
+            .merge_wake(merge_wake_req(
+                seeded.work_id.as_str(),
+                "another gate failed",
+                &["run fmt"],
+            ))
+            .expect("second wake merge should succeed");
+        let pending_wake = store
+            .select_record::<PendingWakeDoc>(&pending_wake_record_id(seeded.work_id.as_str()))
+            .expect("pending wake lookup should work")
+            .expect("pending wake should persist");
+
+        assert_eq!(merged.count, 1);
+        assert_eq!(merged_again.count, 2);
+        assert_eq!(pending_wake.count, 2);
+        assert_eq!(
+            pending_wake.obligations,
+            vec!["run fmt".to_owned(), "run tests".to_owned()]
+        );
+    }
+
+    #[test]
+    fn merge_wake_reuses_existing_runnable_run_without_queue_fanout() {
+        let store = new_store("wake-no-fanout");
+        let seeded = seed_runtime_work(&store);
+
+        store
+            .merge_wake(merge_wake_req(
+                seeded.work_id.as_str(),
+                "first wake",
+                &["cargo test"],
+            ))
+            .expect("first wake should succeed");
+        store
+            .merge_wake(merge_wake_req(
+                seeded.work_id.as_str(),
+                "second wake",
+                &["cargo fmt"],
+            ))
+            .expect("second wake should succeed");
+
+        let runs = store
+            .select_table::<RunDoc>("run")
+            .expect("run docs should load");
+        let runnable = runs
+            .into_iter()
+            .filter(|run| {
+                run.work_id == seeded.work_id.as_str()
+                    && run.status == "queued"
+                    && run.agent_id == seeded.agent_id.as_str()
+            })
+            .collect::<Vec<_>>();
+        let pending_wake = store
+            .select_record::<PendingWakeDoc>(&pending_wake_record_id(seeded.work_id.as_str()))
+            .expect("pending wake lookup should work")
+            .expect("pending wake should persist");
+
+        assert_eq!(runnable.len(), 1);
+        assert_eq!(pending_wake.count, 2);
+        assert_eq!(
+            pending_wake.obligations,
+            vec!["cargo fmt".to_owned(), "cargo test".to_owned()]
+        );
+    }
+
+    #[test]
+    fn merge_wake_for_paused_agent_keeps_pending_wake_without_creating_run() {
+        let store = new_store("wake-paused-agent");
+        let seeded = seed_runtime_work(&store);
+        store
+            .set_agent_status(SetAgentStatusReq {
+                agent_id: seeded.agent_id.clone(),
+                status: AgentStatus::Paused,
+            })
+            .expect("pause should succeed");
+
+        let merged = store
+            .merge_wake(merge_wake_req(
+                seeded.work_id.as_str(),
+                "paused agent wake",
+                &["cargo test"],
+            ))
+            .expect("wake merge should succeed");
+        let runs = store
+            .select_table::<RunDoc>("run")
+            .expect("run docs should load");
+        let runnable = runs
+            .into_iter()
+            .filter(|run| {
+                run.work_id == seeded.work_id.as_str()
+                    && run.status == "queued"
+                    && run.agent_id == seeded.agent_id.as_str()
+            })
+            .collect::<Vec<_>>();
+        let pending_wake = store
+            .select_record::<PendingWakeDoc>(&pending_wake_record_id(seeded.work_id.as_str()))
+            .expect("pending wake lookup should work");
+
+        assert_eq!(merged.count, 1);
+        assert!(pending_wake.is_some());
+        assert!(runnable.is_empty());
+    }
+
+    #[test]
     fn reap_timed_out_running_run_releases_expired_lease_and_queues_follow_up() {
         let store = new_store("reaper");
         let seeded = seed_runtime_work(&store);
@@ -4365,6 +4241,12 @@ mod tests {
             ))
             .expect("lease lookup should work")
             .expect("lease should persist");
+        let timeout_record = store
+            .load_transition_records(&seeded.work_id)
+            .expect("transition records should load")
+            .into_iter()
+            .find(|record| record.kind == TransitionKind::TimeoutRequeue)
+            .expect("timeout record should persist");
         let snapshot = store
             .select_record::<WorkDoc>(&work_record_id(seeded.work_id.as_str()))
             .expect("snapshot lookup should work")
@@ -4374,10 +4256,14 @@ mod tests {
 
         assert!(reaped.iter().any(|item| item.work_id == seeded.work_id));
         assert_eq!(reaped_item.released_lease_id, Some(claimed.lease.lease_id));
-        assert_eq!(failed_run.status, "failed");
+        assert_eq!(failed_run.status, "timed_out");
         assert_eq!(follow_up.status, "queued");
         assert_eq!(lease.release_reason.as_deref(), Some("expired"));
         assert!(lease.released_at_secs.is_some());
+        assert_eq!(timeout_record.actor_kind, ActorKind::System);
+        assert_eq!(timeout_record.actor_id, ActorId::from("system"));
+        assert_eq!(timeout_record.before_status, WorkStatus::Doing);
+        assert_eq!(timeout_record.after_status, Some(WorkStatus::Todo));
         assert_eq!(snapshot.status, WorkStatus::Todo);
         assert!(snapshot.active_lease_id.is_none());
     }
@@ -4438,11 +4324,12 @@ mod tests {
             runtime: RuntimeKind::Coclai,
             runtime_session_id: "runtime-1".to_owned(),
             cwd: "/repo".to_owned(),
+            workspace_fingerprint: workspace_fingerprint("/repo"),
             contract_rev: context.contract.revision,
             last_record_id: Some(RecordId::from("record-1")),
             last_decision_summary: Some(decision.summary.clone()),
             last_gate_summary: None,
-            updated_at: timestamp(40),
+            updated_at: timestamp(0),
         };
         let record = TransitionRecord {
             record_id: RecordId::from("record-1"),
@@ -4450,8 +4337,12 @@ mod tests {
             work_id: seeded.work_id.clone(),
             actor_kind: ActorKind::Agent,
             actor_id: ActorId::from(seeded.agent_id.as_str()),
+            run_id: claimed.lease.run_id.clone(),
+            session_id: Some(session.session_id.clone()),
             lease_id: Some(claimed.lease.lease_id.clone()),
             expected_rev: context.snapshot.rev,
+            contract_set_id: context.snapshot.contract_set_id.clone(),
+            contract_rev: context.snapshot.contract_rev,
             before_status: context.snapshot.status,
             after_status: decision
                 .next_snapshot
@@ -4471,15 +4362,15 @@ mod tests {
                 summary: decision.summary.clone(),
             }),
             evidence_refs: Vec::<EvidenceRef>::new(),
-            happened_at: timestamp(41),
+            happened_at: timestamp(0),
         };
 
         let result = store
-            .commit_decision(CommitDecisionReq {
-                decision: decision.clone(),
-                record: record.clone(),
-                session: Some(session.clone()),
-            })
+            .commit_decision(CommitDecisionReq::new(
+                decision.clone(),
+                record.clone(),
+                Some(session.clone()),
+            ))
             .expect("commit_decision should succeed");
         let persisted_record = store
             .select_record::<TransitionRecordDoc>(&transition_record_id("record-1"))
@@ -4489,14 +4380,29 @@ mod tests {
             .select_record::<ActivityEventDoc>(&super::activity_event_record_id("record-1"))
             .expect("activity lookup should work")
             .expect("activity event should persist");
+        let persisted_work = store
+            .select_record::<WorkDoc>(&work_record_id(seeded.work_id.as_str()))
+            .expect("work lookup should work")
+            .expect("work should persist");
 
         assert_eq!(
-            result.snapshot.expect("snapshot should persist").status,
+            result
+                .snapshot
+                .as_ref()
+                .expect("snapshot should persist")
+                .status,
             WorkStatus::Blocked
         );
         assert!(result.pending_wake.is_none());
         assert!(result.lease.is_none());
-        assert_eq!(result.session, Some(session));
+        assert_ne!(
+            result
+                .session
+                .as_ref()
+                .expect("session should persist")
+                .updated_at,
+            session.updated_at
+        );
         assert_eq!(
             result
                 .activity_event
@@ -4507,11 +4413,58 @@ mod tests {
         assert_eq!(persisted_record.outcome, "accepted");
         assert_eq!(persisted_record.reasons_json, serde_json::json!([]));
         assert_eq!(persisted_record.kind, "block");
+        assert_eq!(
+            persisted_record.run_id.as_deref(),
+            claimed.lease.run_id.as_ref().map(|run_id| run_id.as_str())
+        );
+        assert_eq!(persisted_record.session_id.as_deref(), Some("session-1"));
         assert_eq!(persisted_activity.event_kind, "transition");
         assert_eq!(
             persisted_activity.summary,
             "Block Accepted with next status Blocked"
         );
+        assert_ne!(persisted_record.happened_at_secs, 0);
+        assert_eq!(
+            persisted_work.updated_at_secs,
+            persisted_record.happened_at_secs
+        );
+    }
+
+    #[test]
+    fn surreal_commit_transaction_appends_record_before_projection_updates() {
+        let src = include_str!("store/commit.rs");
+        let transition_upsert = src
+            .find(
+                "UPSERT type::record('transition_record', $transition_id) CONTENT $transition_doc;",
+            )
+            .expect("transition upsert should exist");
+        let activity_upsert = src
+            .find("UPSERT type::record('activity_event', $activity_id) CONTENT $activity_doc;")
+            .expect("activity upsert should exist");
+        let work_upsert = src
+            .find("UPSERT type::record('work', $work_id) CONTENT $work_doc;")
+            .expect("work upsert should exist");
+        let lease_upsert = src
+            .find("UPSERT type::record('lease', $lease_id) CONTENT $lease_doc;")
+            .expect("lease upsert should exist");
+        let session_upsert = src
+            .find("UPSERT type::record('task_session', $session_key) CONTENT $session_doc;")
+            .expect("session upsert should exist");
+
+        assert!(transition_upsert < work_upsert);
+        assert!(activity_upsert < work_upsert);
+        assert!(transition_upsert < lease_upsert);
+        assert!(activity_upsert < lease_upsert);
+        assert!(transition_upsert < session_upsert);
+        assert!(activity_upsert < session_upsert);
+    }
+
+    #[test]
+    fn surreal_direct_claim_and_commit_acquire_share_same_helper() {
+        let store_src = include_str!("store.rs");
+        let commit_src = include_str!("store/commit.rs");
+        assert!(store_src.contains("let prepared = prepare_claim_acquire("));
+        assert!(commit_src.contains("Some(prepare_claim_acquire("));
     }
 
     #[test]
@@ -4527,15 +4480,29 @@ mod tests {
             .expect("claim should succeed");
 
         let error = store
-            .commit_decision(CommitDecisionReq {
-                record: TransitionRecord {
+            .commit_decision(CommitDecisionReq::new(
+                TransitionDecision {
+                    outcome: DecisionOutcome::Rejected,
+                    reasons: vec![crate::model::ReasonCode::RevConflict],
+                    next_snapshot: None,
+                    lease_effect: LeaseEffect::None,
+                    pending_wake_effect: PendingWakeEffect::Retain,
+                    gate_results: Vec::new(),
+                    evidence: Default::default(),
+                    summary: "stale rev".to_owned(),
+                },
+                TransitionRecord {
                     record_id: RecordId::from("record-stale-rev"),
                     company_id: seeded.company_id.clone(),
                     work_id: seeded.work_id.clone(),
                     actor_kind: ActorKind::Agent,
                     actor_id: ActorId::from(seeded.agent_id.as_str()),
+                    run_id: claimed.lease.run_id.clone(),
+                    session_id: None,
                     lease_id: Some(claimed.lease.lease_id),
                     expected_rev: 999,
+                    contract_set_id: ContractSetId::from(seeded.contract_set_id.as_str()),
+                    contract_rev: 1,
                     before_status: WorkStatus::Doing,
                     after_status: None,
                     outcome: DecisionOutcome::Rejected,
@@ -4554,18 +4521,8 @@ mod tests {
                     evidence_refs: Vec::new(),
                     happened_at: timestamp(120),
                 },
-                decision: TransitionDecision {
-                    outcome: DecisionOutcome::Rejected,
-                    reasons: vec![crate::model::ReasonCode::RevConflict],
-                    next_snapshot: None,
-                    lease_effect: LeaseEffect::None,
-                    pending_wake_effect: PendingWakeEffect::Retain,
-                    gate_results: Vec::new(),
-                    evidence: Default::default(),
-                    summary: "stale rev".to_owned(),
-                },
-                session: None,
-            })
+                None,
+            ))
             .expect_err("stale expected_rev should conflict");
 
         assert_eq!(error.kind, StoreErrorKind::Conflict);
@@ -4600,15 +4557,29 @@ mod tests {
             .rev;
 
         let error = store
-            .commit_decision(CommitDecisionReq {
-                record: TransitionRecord {
+            .commit_decision(CommitDecisionReq::new(
+                TransitionDecision {
+                    outcome: DecisionOutcome::Rejected,
+                    reasons: vec![crate::model::ReasonCode::StaleLease],
+                    next_snapshot: None,
+                    lease_effect: LeaseEffect::None,
+                    pending_wake_effect: PendingWakeEffect::Retain,
+                    gate_results: Vec::new(),
+                    evidence: Default::default(),
+                    summary: "stale lease".to_owned(),
+                },
+                TransitionRecord {
                     record_id: RecordId::from("record-stale-lease"),
                     company_id: seeded.company_id.clone(),
                     work_id: seeded.work_id.clone(),
                     actor_kind: ActorKind::Agent,
                     actor_id: ActorId::from(seeded.agent_id.as_str()),
+                    run_id: claimed.lease.run_id.clone(),
+                    session_id: None,
                     lease_id: Some(LeaseId::from("lease-missing")),
                     expected_rev,
+                    contract_set_id: ContractSetId::from(seeded.contract_set_id.as_str()),
+                    contract_rev: 1,
                     before_status: WorkStatus::Doing,
                     after_status: None,
                     outcome: DecisionOutcome::Rejected,
@@ -4627,18 +4598,8 @@ mod tests {
                     evidence_refs: Vec::new(),
                     happened_at: timestamp(121),
                 },
-                decision: TransitionDecision {
-                    outcome: DecisionOutcome::Rejected,
-                    reasons: vec![crate::model::ReasonCode::StaleLease],
-                    next_snapshot: None,
-                    lease_effect: LeaseEffect::None,
-                    pending_wake_effect: PendingWakeEffect::Retain,
-                    gate_results: Vec::new(),
-                    evidence: Default::default(),
-                    summary: "stale lease".to_owned(),
-                },
-                session: None,
-            })
+                None,
+            ))
             .expect_err("stale lease should conflict");
 
         assert_eq!(error.kind, StoreErrorKind::Conflict);
@@ -4722,6 +4683,7 @@ mod tests {
                 runtime: RuntimeKind::Coclai,
                 runtime_session_id: "runtime-queued".to_owned(),
                 cwd: "/repo".to_owned(),
+                workspace_fingerprint: workspace_fingerprint("/repo"),
                 contract_rev: 1,
                 last_record_id: None,
                 last_decision_summary: Some("queued session".to_owned()),
@@ -4820,15 +4782,33 @@ mod tests {
             .snapshot
             .rev;
         store
-            .commit_decision(CommitDecisionReq {
-                record: TransitionRecord {
+            .commit_decision(CommitDecisionReq::new(
+                TransitionDecision {
+                    outcome: DecisionOutcome::Rejected,
+                    reasons: vec![crate::model::ReasonCode::GateFailed],
+                    next_snapshot: None,
+                    lease_effect: LeaseEffect::Keep,
+                    pending_wake_effect: PendingWakeEffect::Retain,
+                    gate_results: vec![GateResult {
+                        gate: GateSpec::AllRequiredObligationsResolved,
+                        passed: false,
+                        detail: "all pending obligations must be resolved".to_owned(),
+                    }],
+                    evidence: Default::default(),
+                    summary: "gate denied completion".to_owned(),
+                },
+                TransitionRecord {
                     record_id: RecordId::from("record-rejected"),
                     company_id: seeded.company_id.clone(),
                     work_id: seeded.work_id.clone(),
                     actor_kind: ActorKind::Agent,
                     actor_id: ActorId::from(seeded.agent_id.as_str()),
+                    run_id: claimed.lease.run_id.clone(),
+                    session_id: None,
                     lease_id: Some(claimed.lease.lease_id),
                     expected_rev,
+                    contract_set_id: ContractSetId::from(seeded.contract_set_id.as_str()),
+                    contract_rev: 1,
                     before_status: WorkStatus::Doing,
                     after_status: None,
                     outcome: DecisionOutcome::Rejected,
@@ -4851,22 +4831,8 @@ mod tests {
                     evidence_refs: Vec::new(),
                     happened_at: timestamp(90),
                 },
-                decision: TransitionDecision {
-                    outcome: DecisionOutcome::Rejected,
-                    reasons: vec![crate::model::ReasonCode::GateFailed],
-                    next_snapshot: None,
-                    lease_effect: LeaseEffect::Keep,
-                    pending_wake_effect: PendingWakeEffect::Retain,
-                    gate_results: vec![GateResult {
-                        gate: GateSpec::AllRequiredObligationsResolved,
-                        passed: false,
-                        detail: "all pending obligations must be resolved".to_owned(),
-                    }],
-                    evidence: Default::default(),
-                    summary: "gate denied completion".to_owned(),
-                },
-                session: None,
-            })
+                None,
+            ))
             .expect("rejected decision should persist");
 
         let board = store.read_board();
@@ -4881,6 +4847,110 @@ mod tests {
             .failed_gates
             .iter()
             .any(|detail| detail == "all pending obligations must be resolved"));
+    }
+
+    #[test]
+    fn read_models_project_transition_record_details_into_board_and_work_audit() {
+        let store = new_store("transition-projection");
+        let seeded = seed_runtime_work(&store);
+        let claimed = store
+            .claim_lease(ClaimLeaseReq {
+                work_id: seeded.work_id.clone(),
+                agent_id: seeded.agent_id.clone(),
+                lease_id: LeaseId::from("lease-transition-projection"),
+            })
+            .expect("claim should succeed");
+        promote_claimed_work_to_doing(
+            &store,
+            &seeded.work_id,
+            &seeded.agent_id,
+            &claimed.lease.lease_id,
+        );
+        let expected_rev = store
+            .load_context(&seeded.work_id)
+            .expect("context should load")
+            .snapshot
+            .rev;
+        store
+            .commit_decision(CommitDecisionReq::new(
+                TransitionDecision {
+                    outcome: DecisionOutcome::Rejected,
+                    reasons: vec![crate::model::ReasonCode::GateFailed],
+                    next_snapshot: None,
+                    lease_effect: LeaseEffect::Keep,
+                    pending_wake_effect: PendingWakeEffect::Retain,
+                    gate_results: vec![GateResult {
+                        gate: GateSpec::AllRequiredObligationsResolved,
+                        passed: false,
+                        detail: "all pending obligations must be resolved".to_owned(),
+                    }],
+                    evidence: Default::default(),
+                    summary: "gate denied completion".to_owned(),
+                },
+                TransitionRecord {
+                    record_id: RecordId::from("record-transition-projection"),
+                    company_id: seeded.company_id.clone(),
+                    work_id: seeded.work_id.clone(),
+                    actor_kind: ActorKind::Agent,
+                    actor_id: ActorId::from(seeded.agent_id.as_str()),
+                    run_id: claimed.lease.run_id.clone(),
+                    session_id: None,
+                    lease_id: Some(claimed.lease.lease_id),
+                    expected_rev,
+                    contract_set_id: ContractSetId::from(seeded.contract_set_id.as_str()),
+                    contract_rev: 1,
+                    before_status: WorkStatus::Doing,
+                    after_status: None,
+                    outcome: DecisionOutcome::Rejected,
+                    reasons: vec![crate::model::ReasonCode::GateFailed],
+                    kind: TransitionKind::Complete,
+                    patch: WorkPatch {
+                        summary: "attempt complete".to_owned(),
+                        resolved_obligations: Vec::new(),
+                        declared_risks: Vec::new(),
+                    },
+                    gate_results: vec![GateResult {
+                        gate: GateSpec::AllRequiredObligationsResolved,
+                        passed: false,
+                        detail: "all pending obligations must be resolved".to_owned(),
+                    }],
+                    evidence: Default::default(),
+                    evidence_inline: Some(EvidenceInline {
+                        summary: "gate denied completion".to_owned(),
+                    }),
+                    evidence_refs: Vec::new(),
+                    happened_at: timestamp(122),
+                },
+                None,
+            ))
+            .expect("rejected decision should persist");
+
+        let board = store.read_board();
+        let work = store
+            .read_work(Some(&seeded.work_id))
+            .expect("work should read");
+
+        assert_eq!(
+            board.recent_transition_records[0],
+            "record-transition-projection"
+        );
+        assert_eq!(
+            board.recent_transition_details[0].record_id,
+            "record-transition-projection"
+        );
+        assert_eq!(board.recent_transition_details[0].kind, "complete");
+        assert_eq!(board.recent_transition_details[0].outcome, "rejected");
+        assert_eq!(
+            board.recent_transition_details[0].summary,
+            "gate denied completion"
+        );
+        assert!(work.items[0].audit_entries.iter().any(|entry| {
+            entry.event_kind == "transition"
+                && entry.summary == "gate denied completion"
+                && entry.outcome.as_deref() == Some("rejected")
+                && entry.before_status == Some(WorkStatus::Doing)
+                && entry.after_status.is_none()
+        }));
     }
 
     #[test]
@@ -4907,15 +4977,33 @@ mod tests {
             .rev;
 
         store
-            .commit_decision(CommitDecisionReq {
-                record: TransitionRecord {
+            .commit_decision(CommitDecisionReq::new(
+                TransitionDecision {
+                    outcome: DecisionOutcome::Rejected,
+                    reasons: vec![crate::model::ReasonCode::GateFailed],
+                    next_snapshot: None,
+                    lease_effect: LeaseEffect::Keep,
+                    pending_wake_effect: PendingWakeEffect::Retain,
+                    gate_results: vec![GateResult {
+                        gate: GateSpec::AllRequiredObligationsResolved,
+                        passed: false,
+                        detail: "all pending obligations must be resolved".to_owned(),
+                    }],
+                    evidence: Default::default(),
+                    summary: "gate denied completion".to_owned(),
+                },
+                TransitionRecord {
                     record_id: RecordId::from("record-reasons"),
                     company_id: seeded.company_id.clone(),
                     work_id: seeded.work_id.clone(),
                     actor_kind: ActorKind::Agent,
                     actor_id: ActorId::from(seeded.agent_id.as_str()),
+                    run_id: claimed.lease.run_id.clone(),
+                    session_id: None,
                     lease_id: Some(claimed.lease.lease_id),
                     expected_rev,
+                    contract_set_id: ContractSetId::from(seeded.contract_set_id.as_str()),
+                    contract_rev: 1,
                     before_status: WorkStatus::Doing,
                     after_status: None,
                     outcome: DecisionOutcome::Rejected,
@@ -4938,22 +5026,8 @@ mod tests {
                     evidence_refs: Vec::new(),
                     happened_at: timestamp(123),
                 },
-                decision: TransitionDecision {
-                    outcome: DecisionOutcome::Rejected,
-                    reasons: vec![crate::model::ReasonCode::GateFailed],
-                    next_snapshot: None,
-                    lease_effect: LeaseEffect::Keep,
-                    pending_wake_effect: PendingWakeEffect::Retain,
-                    gate_results: vec![GateResult {
-                        gate: GateSpec::AllRequiredObligationsResolved,
-                        passed: false,
-                        detail: "all pending obligations must be resolved".to_owned(),
-                    }],
-                    evidence: Default::default(),
-                    summary: "gate denied completion".to_owned(),
-                },
-                session: None,
-            })
+                None,
+            ))
             .expect("rejected decision should persist");
 
         let persisted = store
@@ -4991,6 +5065,14 @@ mod tests {
             .expect("live snapshot should exist")
             .into_snapshot()
             .expect("live snapshot should decode");
+        let pending_wake = store
+            .select_record::<PendingWakeDoc>(&pending_wake_record_id(seeded.work_id.as_str()))
+            .expect("pending wake lookup should work")
+            .expect("pending wake should remain retained");
+        let follow_up_run = store
+            .select_record::<RunDoc>(&run_record_id("run-2"))
+            .expect("follow-up lookup should work")
+            .expect("follow-up queued run should persist");
         let replay_records = store
             .snapshot_state()
             .expect("snapshot state should load")
@@ -5007,8 +5089,12 @@ mod tests {
                 actor_kind: super::parse_actor_kind(&record.actor_kind)
                     .expect("actor kind should parse"),
                 actor_id: ActorId::from(record.actor_id),
+                run_id: record.run_id.map(RunId::from),
+                session_id: record.session_id.map(SessionId::from),
                 lease_id: record.lease_id.map(LeaseId::from),
                 expected_rev: record.expected_rev,
+                contract_set_id: ContractSetId::from(record.contract_set_id),
+                contract_rev: record.contract_rev,
                 before_status: super::parse_work_status(&record.before_status)
                     .expect("before_status should parse"),
                 after_status: record
@@ -5042,6 +5128,8 @@ mod tests {
         let replayed = crate::kernel::replay_snapshot_from_records(&before, &replay_records)
             .expect("timeout replay should succeed");
 
+        assert_eq!(pending_wake.count, 1);
+        assert_eq!(follow_up_run.status, "queued");
         assert_eq!(replayed, live);
     }
 
@@ -5102,6 +5190,7 @@ mod tests {
         company_id: CompanyId,
         agent_id: AgentId,
         second_agent_id: AgentId,
+        contract_set_id: ContractSetId,
         work_id: WorkId,
     }
 
@@ -5110,6 +5199,7 @@ mod tests {
             .create_company(CreateCompanyReq {
                 name: "Acme".to_owned(),
                 description: "runtime".to_owned(),
+                runtime_hard_stop_cents: None,
             })
             .expect("company should create");
         let agent = store
@@ -5164,6 +5254,7 @@ mod tests {
             company_id: company.profile.company_id,
             agent_id: agent.agent_id,
             second_agent_id: second_agent.agent_id,
+            contract_set_id: ContractSetId::from(contracts.contract_set_id.as_str()),
             work_id: work.snapshot.work_id,
         }
     }

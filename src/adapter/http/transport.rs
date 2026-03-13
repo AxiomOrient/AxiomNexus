@@ -67,6 +67,7 @@ struct CreateAgentBody {
 struct CreateCompanyBody {
     name: String,
     description: String,
+    runtime_hard_stop_cents: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -353,6 +354,7 @@ where
             CreateCompanyCmd {
                 name: body.name,
                 description: body.description,
+                runtime_hard_stop_cents: body.runtime_hard_stop_cents,
             },
         ) {
             Ok(ack) => ok_json(&ack),
@@ -617,6 +619,8 @@ fn error_json(status: u16, message: &str) -> HttpResponse {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, path::Path};
+
     use crate::{
         adapter::http::dto::{
             ACTIVITY_ROUTE, AGENTS_ROUTE, BOARD_ROUTE, COMPANIES_ROUTE, CONTRACTS_ACTIVE_ROUTE,
@@ -633,14 +637,56 @@ mod tests {
         app::cmd::create_contract_draft::{handle_create_contract_draft, CreateContractDraftCmd},
         app::cmd::wake_work::{handle_wake_work, WakeWorkCmd},
         model::{
-            ActorId, ActorKind, BillingKind, CompanyId, ConsumptionUsage, ProofHint, ProofHintKind,
-            RuntimeKind, SessionId, TaskSession, TransitionIntent, TransitionKind, WorkId,
-            WorkPatch,
+            workspace_fingerprint, ActorId, ActorKind, BillingKind, CompanyId, ConsumptionUsage,
+            ProofHint, ProofHintKind, RuntimeKind, SessionId, TaskSession, TransitionIntent,
+            TransitionKind, WorkId, WorkPatch,
         },
         port::store::{RecordConsumptionReq, StorePort},
     };
 
     use super::{HttpRequest, HttpTransport, METHOD_GET, METHOD_POST};
+
+    #[test]
+    fn write_routes_delegate_to_app_commands_without_kernel_logic() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let source = fs::read_to_string(repo_root.join("src/adapter/http/transport.rs"))
+            .expect("transport source should load");
+        let production_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("transport source should contain production section");
+
+        for required in [
+            "handle_submit_intent(&self.store, &self.workspace, SubmitIntentCmd",
+            "handle_wake_work(",
+            "handle_create_company(",
+            "handle_create_contract_draft(",
+            "handle_create_work(",
+            "handle_create_agent(",
+            "handle_set_agent_status(",
+            "handle_update_work(",
+        ] {
+            assert!(
+                production_source.contains(required),
+                "write transport should delegate through app command {required}",
+            );
+        }
+
+        for forbidden in [
+            "kernel::decide_transition",
+            ".commit_decision(",
+            ".merge_wake(",
+            ".observe_changed_files(",
+            ".run_gate_command(",
+            ".record_consumption(",
+            ".claim_lease(",
+        ] {
+            assert!(
+                !production_source.contains(forbidden),
+                "write transport should not contain business-rule token {forbidden}",
+            );
+        }
+    }
 
     #[test]
     fn query_routes_return_live_json_payloads() {
@@ -889,6 +935,7 @@ mod tests {
                 runtime: RuntimeKind::Coclai,
                 runtime_session_id: "runtime-running".to_owned(),
                 cwd: "/repo".to_owned(),
+                workspace_fingerprint: workspace_fingerprint("/repo"),
                 contract_rev: 2,
                 last_record_id: None,
                 last_decision_summary: Some("running session".to_owned()),
@@ -940,6 +987,7 @@ mod tests {
                 runtime: RuntimeKind::Coclai,
                 runtime_session_id: "runtime-queued".to_owned(),
                 cwd: "/repo".to_owned(),
+                workspace_fingerprint: workspace_fingerprint("/repo"),
                 contract_rev: 2,
                 last_record_id: None,
                 last_decision_summary: Some("queued session".to_owned()),
@@ -1364,6 +1412,36 @@ mod tests {
             response.emitted_event.expect("after commit event").emission,
             "after commit only"
         );
+    }
+
+    #[test]
+    fn runtime_intent_route_does_not_emit_after_commit_event_on_failed_write() {
+        let transport = HttpTransport::demo();
+        let response = transport.handle(HttpRequest {
+            method: METHOD_POST,
+            path: format!("/api/work/{DEMO_DOING_WORK_ID}/intents"),
+            body: Some(
+                serde_json::to_string(&TransitionIntent {
+                    work_id: WorkId::from(DEMO_DOING_WORK_ID),
+                    agent_id: crate::model::AgentId::from(DEMO_AGENT_ID),
+                    lease_id: crate::model::LeaseId::from(DEMO_LEASE_ID),
+                    expected_rev: 0,
+                    kind: TransitionKind::ProposeProgress,
+                    patch: WorkPatch {
+                        summary: "stale turn".to_owned(),
+                        resolved_obligations: Vec::new(),
+                        declared_risks: Vec::new(),
+                    },
+                    note: None,
+                    proof_hints: Vec::new(),
+                })
+                .expect("intent json should serialize"),
+            ),
+        });
+
+        assert_eq!(response.status, 409);
+        assert!(response.body.contains("expected_rev"));
+        assert!(response.emitted_event.is_none());
     }
 
     #[test]

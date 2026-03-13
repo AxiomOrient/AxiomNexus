@@ -4,7 +4,7 @@ use crate::{
     port::runtime::{RuntimeError, RuntimeErrorKind},
 };
 
-pub(crate) const INVALID_OUTPUT_REPAIR_BUDGET: u8 = 2;
+pub(crate) const INVALID_OUTPUT_REPAIR_BUDGET: u8 = 1;
 const MAX_TEXT_LEN: usize = 4000;
 const MAX_LIST_ITEMS: usize = 64;
 

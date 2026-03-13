@@ -3,10 +3,11 @@ use serde::Serialize;
 use crate::port::{
     runtime::RuntimePort,
     store::{QueuedRunCandidate, RuntimeStorePort, SchedulerStorePort, StoreError},
+    workspace::WorkspacePort,
 };
 
 use super::{
-    resume_session::{handle_resume_session, ResumeSessionCmd},
+    run_turn_once::{handle_run_turn_once, select_runnable_run_id, RunTurnOnceReq},
     RUN_REAPER_TIMEOUT, SCHEDULER_PICK_POLICY,
 };
 
@@ -23,14 +24,15 @@ pub(crate) struct RunSchedulerAck {
 }
 
 pub(crate) fn handle_run_scheduler(
-    store: &(impl SchedulerStorePort + RuntimeStorePort),
+    store: &(impl SchedulerStorePort + RuntimeStorePort + crate::port::store::CommandStorePort),
     runtime: &impl RuntimePort,
+    workspace: &impl WorkspacePort,
     cmd: RunSchedulerCmd,
 ) -> Result<RunSchedulerAck, StoreError> {
     store.reap_timed_out_runs(RUN_REAPER_TIMEOUT)?;
 
     let queued_runs = store.load_queued_runs()?;
-    let Some(run_id) = next_queued_run_id(&queued_runs) else {
+    let Some(run_id) = select_runnable_run_id(&queued_runs) else {
         return Ok(RunSchedulerAck {
             queue_policy: SCHEDULER_PICK_POLICY,
             run_id: None,
@@ -38,10 +40,11 @@ pub(crate) fn handle_run_scheduler(
         });
     };
 
-    let ack = handle_resume_session(
+    let ack = handle_run_turn_once(
         store,
         runtime,
-        ResumeSessionCmd {
+        workspace,
+        RunTurnOnceReq {
             run_id: run_id.clone(),
             cwd: cmd.cwd,
         },
@@ -55,11 +58,7 @@ pub(crate) fn handle_run_scheduler(
 }
 
 pub(crate) fn next_queued_run_id(candidates: &[QueuedRunCandidate]) -> Option<crate::model::RunId> {
-    candidates
-        .iter()
-        .filter(|candidate| candidate.agent_status == Some(crate::model::AgentStatus::Active))
-        .min_by_key(|candidate| candidate.created_at)
-        .map(|candidate| candidate.run_id.clone())
+    select_runnable_run_id(candidates)
 }
 
 #[cfg(test)]
@@ -72,21 +71,58 @@ mod tests {
                 assets::RuntimeAssets,
                 runtime::{CoclaiRuntime, ScriptedReply},
             },
-            memory::store::{
-                MemoryStore, DEMO_AGENT_ID, DEMO_DOING_WORK_ID, DEMO_LEASE_ID, DEMO_TODO_WORK_ID,
-            },
+            memory::store::{MemoryStore, DEMO_AGENT_ID, DEMO_DOING_WORK_ID, DEMO_TODO_WORK_ID},
         },
         model::{
-            AgentId, ConsumptionUsage, LeaseId, TransitionIntent, TransitionKind, WorkId,
-            WorkPatch, WorkStatus,
+            ActorId, ActorKind, AgentId, AgentStatus, BillingKind, CompanyId, ConsumptionUsage,
+            ContractSetId, TransitionIntent, TransitionKind, WorkId, WorkKind, WorkPatch,
+            WorkStatus,
         },
         port::{
             runtime::RuntimeHandle,
-            store::{MergeWakeReq, SessionKey, StorePort},
+            store::{
+                ActivateContractReq, CreateAgentReq, CreateCompanyReq, CreateContractDraftReq,
+                CreateWorkReq, MergeWakeReq, RecordConsumptionReq, SessionKey, StorePort,
+            },
+            workspace::{WorkspaceError, WorkspacePort},
         },
     };
 
+    use crate::app::cmd::run_turn_once::runtime_lease_id;
+
     use super::{handle_run_scheduler, next_queued_run_id, RunSchedulerCmd};
+
+    #[derive(Default)]
+    struct TestWorkspace;
+
+    impl WorkspacePort for TestWorkspace {
+        fn current_dir(&self) -> Result<String, WorkspaceError> {
+            Ok("/repo".to_owned())
+        }
+
+        fn observe_changed_files(
+            &self,
+            _cwd: &str,
+            _hinted_paths: &[String],
+        ) -> Vec<crate::model::FileChange> {
+            Vec::new()
+        }
+
+        fn run_gate_command(
+            &self,
+            _cwd: &str,
+            argv: &[String],
+            _timeout: std::time::Duration,
+        ) -> crate::model::CommandResult {
+            crate::model::CommandResult {
+                argv: argv.to_vec(),
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+                failure_detail: None,
+            }
+        }
+    }
 
     #[test]
     fn run_scheduler_consumes_oldest_queued_run_and_saves_session() {
@@ -100,8 +136,8 @@ mod tests {
                 },
                 raw_output: valid_output(
                     DEMO_TODO_WORK_ID,
-                    "00000000-0000-4000-8000-000000000013",
-                    0,
+                    runtime_lease_id(&crate::model::RunId::from("run-2")).as_str(),
+                    1,
                     "scheduler turn",
                 ),
                 intent: intent(),
@@ -124,6 +160,7 @@ mod tests {
         let ack = handle_run_scheduler(
             &store,
             &runtime,
+            &TestWorkspace,
             RunSchedulerCmd {
                 cwd: "/repo".to_owned(),
             },
@@ -153,12 +190,116 @@ mod tests {
         let ack = handle_run_scheduler(
             &store,
             &runtime,
+            &TestWorkspace,
             RunSchedulerCmd {
                 cwd: "/repo".to_owned(),
             },
         )
         .expect("idle scheduler should not fail");
 
+        assert!(ack.run_id.is_none());
+        assert!(ack.runtime_session_id.is_none());
+    }
+
+    #[test]
+    fn run_scheduler_skips_budget_blocked_queue_before_runtime_start() {
+        let assets = RuntimeAssets::load_from_repo_root(Path::new(env!("CARGO_MANIFEST_DIR")))
+            .expect("assets should load");
+        let runtime = CoclaiRuntime::with_scripted_replies(assets, Vec::new());
+        let store = MemoryStore::demo();
+        let company = store
+            .create_company(CreateCompanyReq {
+                name: "Budget Labs".to_owned(),
+                description: "company hard stop".to_owned(),
+                runtime_hard_stop_cents: Some(5),
+            })
+            .expect("company create should succeed");
+        let rules = store.read_contracts().rules;
+        let draft = store
+            .create_contract_draft(CreateContractDraftReq {
+                company_id: company.profile.company_id.clone(),
+                name: "budget-contract".to_owned(),
+                rules,
+            })
+            .expect("contract draft should succeed");
+        store
+            .activate_contract(ActivateContractReq {
+                company_id: company.profile.company_id.clone(),
+                revision: draft.revision,
+            })
+            .expect("contract should activate");
+        let contract_set_id = store
+            .read_companies()
+            .items
+            .into_iter()
+            .find(|item| item.company_id == company.profile.company_id.as_str())
+            .and_then(|item| item.active_contract_set_id)
+            .expect("new company should expose active contract");
+        let agent = store
+            .create_agent(CreateAgentReq {
+                company_id: company.profile.company_id.clone(),
+                name: "Budget Agent".to_owned(),
+                role: "operator".to_owned(),
+            })
+            .expect("agent create should succeed");
+        let work = store
+            .create_work(CreateWorkReq {
+                company_id: company.profile.company_id.clone(),
+                parent_id: None,
+                kind: WorkKind::Task,
+                title: "Blocked work".to_owned(),
+                body: "budget check".to_owned(),
+                contract_set_id: ContractSetId::from(contract_set_id),
+            })
+            .expect("work create should succeed");
+        store
+            .merge_wake(MergeWakeReq {
+                work_id: work.snapshot.work_id.clone(),
+                actor_kind: ActorKind::Board,
+                actor_id: ActorId::from("board"),
+                source: "manual".to_owned(),
+                reason: "budget check".to_owned(),
+                obligations: vec!["stay queued".to_owned()],
+            })
+            .expect("wake should create queued run");
+        let queued_run = store
+            .load_queued_runs()
+            .expect("queued runs should load")
+            .into_iter()
+            .find(|candidate| candidate.agent_status == Some(AgentStatus::Active))
+            .expect("queued run should exist");
+        store
+            .record_consumption(RecordConsumptionReq {
+                company_id: CompanyId::from(company.profile.company_id.as_str()),
+                agent_id: agent.agent_id.clone(),
+                run_id: queued_run.run_id.clone(),
+                billing_kind: BillingKind::Api,
+                usage: ConsumptionUsage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    run_seconds: 1,
+                    estimated_cost_cents: Some(5),
+                },
+            })
+            .expect("consumption should persist");
+
+        let blocked_run = store
+            .load_queued_runs()
+            .expect("queued runs should load")
+            .into_iter()
+            .find(|candidate| candidate.run_id == queued_run.run_id)
+            .expect("queued run should still exist");
+        let ack = handle_run_scheduler(
+            &store,
+            &runtime,
+            &TestWorkspace,
+            RunSchedulerCmd {
+                cwd: "/repo".to_owned(),
+            },
+        )
+        .expect("scheduler should skip budget blocked run");
+
+        assert!(blocked_run.budget_blocked);
         assert!(ack.run_id.is_none());
         assert!(ack.runtime_session_id.is_none());
     }
@@ -175,8 +316,8 @@ mod tests {
                 },
                 raw_output: valid_output(
                     DEMO_DOING_WORK_ID,
-                    DEMO_LEASE_ID,
-                    2,
+                    runtime_lease_id(&crate::model::RunId::from("run-2")).as_str(),
+                    3,
                     "reaped scheduler turn",
                 ),
                 intent: doing_work_intent(),
@@ -199,6 +340,7 @@ mod tests {
         let ack = handle_run_scheduler(
             &store,
             &runtime,
+            &TestWorkspace,
             RunSchedulerCmd {
                 cwd: "/repo".to_owned(),
             },
@@ -219,8 +361,11 @@ mod tests {
         assert_eq!(ack.run_id.as_deref(), Some("run-2"));
         assert_eq!(ack.runtime_session_id.as_deref(), Some("runtime-reaped"));
         assert_eq!(session.runtime_session_id, "runtime-reaped");
-        assert_eq!(work.items[0].active_lease_id, None);
-        assert_eq!(work.items[0].status, WorkStatus::Todo);
+        assert_eq!(
+            work.items[0].active_lease_id.as_deref(),
+            Some(runtime_lease_id(&crate::model::RunId::from("run-2")).as_str())
+        );
+        assert_eq!(work.items[0].status, WorkStatus::Doing);
         assert_eq!(work.items[0].comments.len(), 2);
         assert_eq!(
             work.items[0].comments[0].author_kind,
@@ -254,8 +399,8 @@ mod tests {
                 },
                 raw_output: valid_output(
                     DEMO_TODO_WORK_ID,
-                    "00000000-0000-4000-8000-000000000013",
-                    0,
+                    runtime_lease_id(&crate::model::RunId::from("run-2")).as_str(),
+                    1,
                     "scheduler turn",
                 ),
                 intent: intent(),
@@ -288,6 +433,7 @@ mod tests {
         let ack = handle_run_scheduler(
             &store,
             &runtime,
+            &TestWorkspace,
             RunSchedulerCmd {
                 cwd: "/repo".to_owned(),
             },
@@ -335,8 +481,8 @@ mod tests {
         TransitionIntent {
             work_id: WorkId::from(DEMO_TODO_WORK_ID),
             agent_id: AgentId::from(DEMO_AGENT_ID),
-            lease_id: LeaseId::from("00000000-0000-4000-8000-000000000013"),
-            expected_rev: 0,
+            lease_id: runtime_lease_id(&crate::model::RunId::from("run-2")),
+            expected_rev: 1,
             kind: TransitionKind::ProposeProgress,
             patch: WorkPatch {
                 summary: "scheduler turn".to_owned(),
@@ -355,8 +501,8 @@ mod tests {
         TransitionIntent {
             work_id: WorkId::from(DEMO_DOING_WORK_ID),
             agent_id: AgentId::from(DEMO_AGENT_ID),
-            lease_id: LeaseId::from(DEMO_LEASE_ID),
-            expected_rev: 2,
+            lease_id: runtime_lease_id(&crate::model::RunId::from("run-2")),
+            expected_rev: 3,
             kind: TransitionKind::ProposeProgress,
             patch: WorkPatch {
                 summary: "reaped scheduler turn".to_owned(),

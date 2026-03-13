@@ -26,13 +26,21 @@ pub(crate) trait StorePort {
         &self,
         req: ActivateContractReq,
     ) -> Result<ActivateContractRes, StoreError>;
+    fn claim_lease(&self, req: ClaimLeaseReq) -> Result<ClaimLeaseRes, StoreError>;
     fn load_context(&self, work_id: &WorkId) -> Result<WorkContext, StoreError>;
+    fn list_work_snapshots(&self) -> Result<Vec<WorkSnapshot>, StoreError>;
+    fn load_transition_records(
+        &self,
+        work_id: &WorkId,
+    ) -> Result<Vec<TransitionRecord>, StoreError>;
     fn merge_wake(&self, req: MergeWakeReq) -> Result<PendingWake, StoreError>;
     fn reap_timed_out_runs(&self, timeout: Duration) -> Result<Vec<ReapedRun>, StoreError>;
     fn load_queued_runs(&self) -> Result<Vec<QueuedRunCandidate>, StoreError>;
     fn load_runtime_turn(&self, run_id: &RunId) -> Result<RuntimeTurnContext, StoreError>;
     fn load_agent_facts(&self, agent_id: &AgentId) -> Result<Option<AgentFacts>, StoreError>;
     fn mark_run_running(&self, run_id: &RunId) -> Result<(), StoreError>;
+    fn mark_run_completed(&self, run_id: &RunId) -> Result<(), StoreError>;
+    fn mark_run_failed(&self, run_id: &RunId, reason: &str) -> Result<(), StoreError>;
     fn load_session(&self, key: &SessionKey) -> Result<Option<TaskSession>, StoreError>;
     fn save_session(&self, session: &TaskSession) -> Result<(), StoreError>;
     fn record_consumption(&self, req: RecordConsumptionReq) -> Result<(), StoreError>;
@@ -61,6 +69,7 @@ pub(crate) trait CommandStorePort {
         &self,
         req: ActivateContractReq,
     ) -> Result<ActivateContractRes, StoreError>;
+    fn claim_lease(&self, req: ClaimLeaseReq) -> Result<ClaimLeaseRes, StoreError>;
     fn load_context(&self, work_id: &WorkId) -> Result<WorkContext, StoreError>;
     fn load_agent_facts(&self, agent_id: &AgentId) -> Result<Option<AgentFacts>, StoreError>;
     fn load_session(&self, key: &SessionKey) -> Result<Option<TaskSession>, StoreError>;
@@ -110,6 +119,10 @@ where
         StorePort::activate_contract(self, req)
     }
 
+    fn claim_lease(&self, req: ClaimLeaseReq) -> Result<ClaimLeaseRes, StoreError> {
+        StorePort::claim_lease(self, req)
+    }
+
     fn load_context(&self, work_id: &WorkId) -> Result<WorkContext, StoreError> {
         StorePort::load_context(self, work_id)
     }
@@ -132,10 +145,13 @@ where
 }
 
 pub(crate) trait RuntimeStorePort {
+    fn claim_lease(&self, req: ClaimLeaseReq) -> Result<ClaimLeaseRes, StoreError>;
     fn load_runtime_turn(&self, run_id: &RunId) -> Result<RuntimeTurnContext, StoreError>;
     fn load_session(&self, key: &SessionKey) -> Result<Option<TaskSession>, StoreError>;
     fn save_session(&self, session: &TaskSession) -> Result<(), StoreError>;
     fn mark_run_running(&self, run_id: &RunId) -> Result<(), StoreError>;
+    fn mark_run_completed(&self, run_id: &RunId) -> Result<(), StoreError>;
+    fn mark_run_failed(&self, run_id: &RunId, reason: &str) -> Result<(), StoreError>;
     fn record_consumption(&self, req: RecordConsumptionReq) -> Result<(), StoreError>;
 }
 
@@ -143,6 +159,10 @@ impl<T> RuntimeStorePort for T
 where
     T: StorePort + ?Sized,
 {
+    fn claim_lease(&self, req: ClaimLeaseReq) -> Result<ClaimLeaseRes, StoreError> {
+        StorePort::claim_lease(self, req)
+    }
+
     fn load_runtime_turn(&self, run_id: &RunId) -> Result<RuntimeTurnContext, StoreError> {
         StorePort::load_runtime_turn(self, run_id)
     }
@@ -157,6 +177,14 @@ where
 
     fn mark_run_running(&self, run_id: &RunId) -> Result<(), StoreError> {
         StorePort::mark_run_running(self, run_id)
+    }
+
+    fn mark_run_completed(&self, run_id: &RunId) -> Result<(), StoreError> {
+        StorePort::mark_run_completed(self, run_id)
+    }
+
+    fn mark_run_failed(&self, run_id: &RunId, reason: &str) -> Result<(), StoreError> {
+        StorePort::mark_run_failed(self, run_id, reason)
     }
 
     fn record_consumption(&self, req: RecordConsumptionReq) -> Result<(), StoreError> {
@@ -190,6 +218,30 @@ pub(crate) trait QueryStorePort {
     fn read_activity(&self) -> ActivityReadModel;
     fn read_run(&self, run_id: &RunId) -> Result<RunReadModel, StoreError>;
     fn read_contracts(&self) -> ContractsReadModel;
+}
+
+pub(crate) trait ReplayStorePort {
+    fn list_work_snapshots(&self) -> Result<Vec<WorkSnapshot>, StoreError>;
+    fn load_transition_records(
+        &self,
+        work_id: &WorkId,
+    ) -> Result<Vec<TransitionRecord>, StoreError>;
+}
+
+impl<T> ReplayStorePort for T
+where
+    T: StorePort + ?Sized,
+{
+    fn list_work_snapshots(&self) -> Result<Vec<WorkSnapshot>, StoreError> {
+        StorePort::list_work_snapshots(self)
+    }
+
+    fn load_transition_records(
+        &self,
+        work_id: &WorkId,
+    ) -> Result<Vec<TransitionRecord>, StoreError> {
+        StorePort::load_transition_records(self, work_id)
+    }
 }
 
 impl<T> QueryStorePort for T
@@ -288,6 +340,8 @@ pub(crate) struct CompanySummaryView {
     pub(crate) company_id: String,
     pub(crate) name: String,
     pub(crate) description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) runtime_hard_stop_cents: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) active_contract_set_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -477,6 +531,7 @@ pub(crate) struct CreateAgentReq {
 pub(crate) struct CreateCompanyReq {
     pub(crate) name: String,
     pub(crate) description: String,
+    pub(crate) runtime_hard_stop_cents: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -581,6 +636,7 @@ pub(crate) struct ReapedRun {
 pub(crate) struct QueuedRunCandidate {
     pub(crate) run_id: RunId,
     pub(crate) agent_status: Option<AgentStatus>,
+    pub(crate) budget_blocked: bool,
     pub(crate) created_at: crate::model::Timestamp,
 }
 
@@ -611,8 +667,38 @@ pub(crate) struct RecordConsumptionReq {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitDecisionReq {
     pub(crate) decision: TransitionDecision,
+    pub(crate) context: CommitDecisionContext,
+    pub(crate) effects: CommitDecisionEffects,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommitDecisionContext {
     pub(crate) record: TransitionRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommitDecisionEffects {
+    pub(crate) lease: crate::model::LeaseEffect,
+    pub(crate) pending_wake: crate::model::PendingWakeEffect,
     pub(crate) session: Option<TaskSession>,
+}
+
+impl CommitDecisionReq {
+    pub(crate) fn new(
+        decision: TransitionDecision,
+        record: TransitionRecord,
+        session: Option<TaskSession>,
+    ) -> Self {
+        Self {
+            effects: CommitDecisionEffects {
+                lease: decision.lease_effect,
+                pending_wake: decision.pending_wake_effect,
+                session,
+            },
+            decision,
+            context: CommitDecisionContext { record },
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -653,3 +739,77 @@ impl StoreError {
 }
 
 impl Error for StoreError {}
+
+#[cfg(test)]
+mod tests {
+    use std::time::SystemTime;
+
+    use crate::model::{
+        ActorId, ActorKind, CompanyId, DecisionOutcome, EvidenceBundle, LeaseEffect, LeaseId,
+        PendingWakeEffect, RecordId, TaskSession, TransitionDecision, TransitionKind,
+        TransitionRecord, WorkId, WorkPatch, WorkStatus,
+    };
+
+    use super::CommitDecisionReq;
+
+    #[test]
+    fn commit_decision_req_new_separates_context_and_effects() {
+        let decision = TransitionDecision {
+            outcome: DecisionOutcome::Accepted,
+            reasons: Vec::new(),
+            next_snapshot: None,
+            lease_effect: LeaseEffect::Release,
+            pending_wake_effect: PendingWakeEffect::Clear,
+            gate_results: Vec::new(),
+            evidence: EvidenceBundle::default(),
+            summary: "accepted".to_owned(),
+        };
+        let record = TransitionRecord {
+            record_id: RecordId::from("record-1"),
+            company_id: CompanyId::from("company-1"),
+            work_id: WorkId::from("work-1"),
+            actor_kind: ActorKind::Agent,
+            actor_id: ActorId::from("agent-1"),
+            run_id: None,
+            session_id: None,
+            lease_id: Some(LeaseId::from("lease-1")),
+            expected_rev: 1,
+            contract_set_id: crate::model::ContractSetId::from("contract-1"),
+            contract_rev: 1,
+            before_status: WorkStatus::Doing,
+            after_status: Some(WorkStatus::Done),
+            outcome: DecisionOutcome::Accepted,
+            reasons: Vec::new(),
+            kind: TransitionKind::Complete,
+            patch: WorkPatch::default(),
+            gate_results: Vec::new(),
+            evidence: EvidenceBundle::default(),
+            evidence_inline: None,
+            evidence_refs: Vec::new(),
+            happened_at: SystemTime::UNIX_EPOCH,
+        };
+        let session = Some(TaskSession {
+            session_id: crate::model::SessionId::from("session-1"),
+            company_id: CompanyId::from("company-1"),
+            agent_id: crate::model::AgentId::from("agent-1"),
+            work_id: WorkId::from("work-1"),
+            runtime: crate::model::RuntimeKind::Coclai,
+            runtime_session_id: "runtime-1".to_owned(),
+            cwd: "/repo".to_owned(),
+            workspace_fingerprint: "fingerprint".to_owned(),
+            contract_rev: 1,
+            last_record_id: None,
+            last_decision_summary: None,
+            last_gate_summary: None,
+            updated_at: SystemTime::UNIX_EPOCH,
+        });
+
+        let req = CommitDecisionReq::new(decision.clone(), record.clone(), session.clone());
+
+        assert_eq!(req.decision, decision);
+        assert_eq!(req.context.record, record);
+        assert_eq!(req.effects.lease, LeaseEffect::Release);
+        assert_eq!(req.effects.pending_wake, PendingWakeEffect::Clear);
+        assert_eq!(req.effects.session, session);
+    }
+}

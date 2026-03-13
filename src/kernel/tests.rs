@@ -1,16 +1,18 @@
 use std::time::{Duration, SystemTime};
 
 use crate::model::{
-    ActorKind, AgentId, AgentStatus, ChangeKind, CommandResult, CompanyId, ContractSet,
-    ContractSetId, ContractSetStatus, DecisionOutcome, EvidenceBundle, FileChange, GateSpec,
-    LeaseEffect, LeaseId, PendingWake, PendingWakeEffect, ProofHint, ProofHintKind, ReasonCode,
-    RecordId, Rev, RuntimeKind, SessionId, TaskSession, TransitionIntent, TransitionKind,
-    TransitionRecord, TransitionRule, WorkId, WorkKind, WorkLease, WorkSnapshot, WorkStatus,
+    workspace_fingerprint, ActorKind, AgentId, AgentStatus, ChangeKind, CommandResult, CompanyId,
+    ContractSet, ContractSetId, ContractSetStatus, DecisionOutcome, EvidenceBundle, FileChange,
+    GateSpec, LeaseEffect, LeaseId, PendingWake, PendingWakeEffect, ProofHint, ProofHintKind,
+    ReasonCode, RecordId, Rev, RuntimeKind, SessionId, SessionInvalidationReason, TaskSession,
+    TransitionIntent, TransitionKind, TransitionRecord, TransitionRule, WorkId, WorkKind,
+    WorkLease, WorkSnapshot, WorkStatus,
 };
 
 use super::{
     advance_session, claim_lease, command_gate_specs, decide_transition, merge_wake,
-    replay_snapshot_from_records,
+    replay_snapshot_from_records, session_invalidation_reason, timeout_requeue_transition,
+    wake_run_plan, WakeRunPlan,
 };
 
 #[test]
@@ -491,13 +493,30 @@ fn merge_wake_coalesces_obligations_and_bumps_count() {
 }
 
 #[test]
+fn wake_run_plan_prioritizes_open_lease_then_existing_run_then_queue() {
+    assert_eq!(
+        wake_run_plan(true, true, true),
+        WakeRunPlan::SkipBecauseOpenLease
+    );
+    assert_eq!(
+        wake_run_plan(false, true, true),
+        WakeRunPlan::RefreshExistingRun
+    );
+    assert_eq!(wake_run_plan(false, false, true), WakeRunPlan::QueueNewRun);
+    assert_eq!(
+        wake_run_plan(false, false, false),
+        WakeRunPlan::SkipBecauseNoRunnableAgent
+    );
+}
+
+#[test]
 fn advance_session_resumes_same_work_session() {
     let existing = session("session-1", "runtime-1", "work-1", "agent-1", "/repo");
     let mut candidate = session("session-2", "runtime-2", "work-1", "agent-1", "/repo");
     candidate.last_record_id = Some(RecordId::from("record-9"));
     candidate.last_decision_summary = Some("accepted".to_owned());
 
-    let resumed = advance_session(Some(&existing), candidate, false);
+    let resumed = advance_session(Some(&existing), candidate, None);
 
     assert_eq!(resumed.session_id, SessionId::from("session-1"));
     assert_eq!(resumed.runtime_session_id, "runtime-1");
@@ -510,10 +529,60 @@ fn advance_session_resets_on_invalid_runtime_session() {
     let existing = session("session-1", "runtime-1", "work-1", "agent-1", "/repo");
     let candidate = session("session-2", "runtime-2", "work-1", "agent-1", "/repo");
 
-    let reset = advance_session(Some(&existing), candidate.clone(), true);
+    let reset = advance_session(
+        Some(&existing),
+        candidate.clone(),
+        Some(SessionInvalidationReason::Runtime),
+    );
 
     assert_eq!(reset.session_id, candidate.session_id);
     assert_eq!(reset.runtime_session_id, candidate.runtime_session_id);
+}
+
+#[test]
+fn session_invalidation_reason_distinguishes_mismatch_causes() {
+    let existing = session("session-1", "runtime-1", "work-1", "agent-1", "/repo");
+
+    assert_eq!(
+        session_invalidation_reason(
+            &existing,
+            &AgentId::from("agent-2"),
+            &WorkId::from("work-1"),
+            "/repo",
+            RuntimeKind::Coclai,
+        ),
+        Some(SessionInvalidationReason::Agent)
+    );
+    assert_eq!(
+        session_invalidation_reason(
+            &existing,
+            &AgentId::from("agent-1"),
+            &WorkId::from("work-2"),
+            "/repo",
+            RuntimeKind::Coclai,
+        ),
+        Some(SessionInvalidationReason::Work)
+    );
+    assert_eq!(
+        session_invalidation_reason(
+            &existing,
+            &AgentId::from("agent-1"),
+            &WorkId::from("work-1"),
+            "/other",
+            RuntimeKind::Coclai,
+        ),
+        Some(SessionInvalidationReason::Workspace)
+    );
+    assert_eq!(
+        session_invalidation_reason(
+            &existing,
+            &AgentId::from("agent-1"),
+            &WorkId::from("work-1"),
+            "/repo",
+            RuntimeKind::Coclai,
+        ),
+        None
+    );
 }
 
 #[test]
@@ -611,8 +680,12 @@ fn replay_reconstructs_timeout_requeue_snapshot_chain() {
         work_id: WorkId::from("work-1"),
         actor_kind: ActorKind::Board,
         actor_id: crate::model::ActorId::from("board"),
+        run_id: None,
+        session_id: None,
         lease_id: None,
         expected_rev: 0,
+        contract_set_id: ContractSetId::from("contract-1"),
+        contract_rev: 1,
         before_status: WorkStatus::Backlog,
         after_status: Some(WorkStatus::Todo),
         outcome: DecisionOutcome::Accepted,
@@ -636,8 +709,12 @@ fn replay_reconstructs_timeout_requeue_snapshot_chain() {
         work_id: WorkId::from("work-1"),
         actor_kind: ActorKind::Agent,
         actor_id: crate::model::ActorId::from("agent-1"),
+        run_id: Some(crate::model::RunId::from("run-1")),
+        session_id: None,
         lease_id: Some(LeaseId::from("lease-1")),
         expected_rev: 1,
+        contract_set_id: ContractSetId::from("contract-1"),
+        contract_rev: 1,
         before_status: WorkStatus::Todo,
         after_status: Some(WorkStatus::Doing),
         outcome: DecisionOutcome::Accepted,
@@ -661,8 +738,12 @@ fn replay_reconstructs_timeout_requeue_snapshot_chain() {
         work_id: WorkId::from("work-1"),
         actor_kind: ActorKind::System,
         actor_id: crate::model::ActorId::from("system"),
+        run_id: Some(crate::model::RunId::from("run-1")),
+        session_id: None,
         lease_id: Some(LeaseId::from("lease-1")),
         expected_rev: 2,
+        contract_set_id: ContractSetId::from("contract-1"),
+        contract_rev: 1,
         before_status: WorkStatus::Doing,
         after_status: Some(WorkStatus::Todo),
         outcome: DecisionOutcome::Accepted,
@@ -691,6 +772,44 @@ fn replay_reconstructs_timeout_requeue_snapshot_chain() {
 }
 
 #[test]
+fn timeout_requeue_transition_uses_system_actor_and_requeues_work() {
+    let snapshot = snapshot(WorkStatus::Doing, Some("lease-1"), 2);
+    let lease_id = LeaseId::from("lease-1");
+    let reaped_at = SystemTime::UNIX_EPOCH + Duration::from_secs(5);
+
+    let (decision, record) = timeout_requeue_transition(&snapshot, "run-1", &lease_id, reaped_at);
+
+    assert_eq!(decision.outcome, DecisionOutcome::Accepted);
+    assert_eq!(decision.lease_effect, LeaseEffect::Release);
+    assert_eq!(decision.pending_wake_effect, PendingWakeEffect::Retain);
+    assert_eq!(
+        decision.next_snapshot.as_ref().map(|next| next.status),
+        Some(WorkStatus::Todo)
+    );
+    assert_eq!(
+        decision
+            .next_snapshot
+            .as_ref()
+            .and_then(|next| next.active_lease_id.clone()),
+        None
+    );
+    assert_eq!(
+        decision
+            .next_snapshot
+            .as_ref()
+            .and_then(|next| next.assignee_agent_id.clone()),
+        None
+    );
+    assert_eq!(record.actor_kind, ActorKind::System);
+    assert_eq!(record.actor_id, crate::model::ActorId::from("system"));
+    assert_eq!(record.kind, TransitionKind::TimeoutRequeue);
+    assert_eq!(record.before_status, WorkStatus::Doing);
+    assert_eq!(record.after_status, Some(WorkStatus::Todo));
+    assert_eq!(record.expected_rev, 2);
+    assert_eq!(record.lease_id, Some(lease_id));
+}
+
+#[test]
 fn replay_rejects_accepted_record_without_after_status() {
     let base = snapshot(WorkStatus::Doing, Some("lease-1"), 2);
     let record = TransitionRecord {
@@ -699,8 +818,12 @@ fn replay_rejects_accepted_record_without_after_status() {
         work_id: WorkId::from("work-1"),
         actor_kind: ActorKind::Agent,
         actor_id: crate::model::ActorId::from("agent-1"),
+        run_id: None,
+        session_id: None,
         lease_id: Some(LeaseId::from("lease-1")),
         expected_rev: 2,
+        contract_set_id: ContractSetId::from("contract-1"),
+        contract_rev: 1,
         before_status: WorkStatus::Doing,
         after_status: None,
         outcome: DecisionOutcome::Accepted,
@@ -719,6 +842,7 @@ fn replay_rejects_accepted_record_without_after_status() {
     let error = replay_snapshot_from_records(&base, &[record])
         .expect_err("accepted replay without after_status should fail");
 
+    assert_eq!(error.code.as_str(), "missing_after_status");
     assert!(error.message.contains("missing after_status"));
 }
 
@@ -731,8 +855,12 @@ fn replay_rejects_record_before_status_mismatch() {
         work_id: WorkId::from("work-1"),
         actor_kind: ActorKind::Board,
         actor_id: crate::model::ActorId::from("board"),
+        run_id: None,
+        session_id: None,
         lease_id: None,
         expected_rev: 1,
+        contract_set_id: ContractSetId::from("contract-1"),
+        contract_rev: 1,
         before_status: WorkStatus::Doing,
         after_status: Some(WorkStatus::Done),
         outcome: DecisionOutcome::Accepted,
@@ -751,7 +879,44 @@ fn replay_rejects_record_before_status_mismatch() {
     let error = replay_snapshot_from_records(&base, &[record])
         .expect_err("before_status mismatch should fail replay");
 
+    assert_eq!(error.code.as_str(), "status_mismatch");
     assert!(error.message.contains("before_status does not match"));
+}
+
+#[test]
+fn replay_rejects_contract_pin_mismatch() {
+    let base = snapshot(WorkStatus::Todo, None, 1);
+    let record = TransitionRecord {
+        record_id: RecordId::from("record-contract-mismatch"),
+        company_id: CompanyId::from("company-1"),
+        work_id: WorkId::from("work-1"),
+        actor_kind: ActorKind::Board,
+        actor_id: crate::model::ActorId::from("board"),
+        run_id: None,
+        session_id: None,
+        lease_id: None,
+        expected_rev: 1,
+        contract_set_id: ContractSetId::from("contract-other"),
+        contract_rev: 1,
+        before_status: WorkStatus::Todo,
+        after_status: Some(WorkStatus::Done),
+        outcome: DecisionOutcome::Accepted,
+        reasons: Vec::new(),
+        kind: TransitionKind::OverrideComplete,
+        patch: crate::model::WorkPatch::default(),
+        gate_results: Vec::new(),
+        evidence: EvidenceBundle::default(),
+        evidence_inline: Some(crate::model::EvidenceInline {
+            summary: "override".to_owned(),
+        }),
+        evidence_refs: Vec::new(),
+        happened_at: SystemTime::UNIX_EPOCH + Duration::from_secs(2),
+    };
+
+    let error = replay_snapshot_from_records(&base, &[record])
+        .expect_err("contract pin mismatch should fail replay");
+
+    assert_eq!(error.code.as_str(), "contract_pin_mismatch");
 }
 
 fn snapshot(status: WorkStatus, active_lease_id: Option<&str>, rev: Rev) -> WorkSnapshot {
@@ -873,6 +1038,7 @@ fn session(
         runtime: RuntimeKind::Coclai,
         runtime_session_id: runtime_session_id.to_owned(),
         cwd: cwd.to_owned(),
+        workspace_fingerprint: workspace_fingerprint(cwd),
         contract_rev: 1,
         last_record_id: None,
         last_decision_summary: None,

@@ -67,20 +67,6 @@ evals/fixtures/generated/
 .cursor/
 .cache/
 
-# Triad governance state
-.triad/*
-!.triad/evidence.ndjson
-!.triad/patches/
-!.triad/patches/**
-!.triad/schemas/
-!.triad/schemas/**
-.triad/cache.sqlite
-.triad/cache.sqlite-*
-.triad/runs/
-.triad/runs/**
-.triad/tmp/
-.triad/tmp/**
-
 # Project runtime system outputs
 project/system/logbook.jsonl
 project/system/logbook.md

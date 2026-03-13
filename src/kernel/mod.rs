@@ -3,17 +3,19 @@
 mod apply;
 mod claim;
 mod decide;
+mod reaper;
 mod replay;
 mod session;
 mod wake;
 
 use std::time::SystemTime;
 
+pub(crate) use self::replay::ReplayError;
 pub(crate) use self::wake::WakeRunPlan;
 
 use crate::model::{
-    ContractSet, EvidenceBundle, PendingWake, ReasonCode, TaskSession, TransitionDecision,
-    TransitionIntent, WorkId, WorkLease, WorkSnapshot, WorkStatus,
+    ContractSet, EvidenceBundle, PendingWake, ReasonCode, SessionInvalidationReason, TaskSession,
+    TransitionDecision, TransitionIntent, WorkId, WorkLease, WorkSnapshot, WorkStatus,
 };
 
 pub(crate) fn decide_transition(
@@ -76,9 +78,19 @@ pub(crate) fn wake_run_plan(
 pub(crate) fn advance_session(
     existing: Option<&TaskSession>,
     candidate: TaskSession,
-    invalid_session: bool,
+    invalidation_reason: Option<SessionInvalidationReason>,
 ) -> TaskSession {
-    session::advance_session(existing, candidate, invalid_session)
+    session::advance_session(existing, candidate, invalidation_reason)
+}
+
+pub(crate) fn session_invalidation_reason(
+    existing: &TaskSession,
+    agent_id: &crate::model::AgentId,
+    work_id: &WorkId,
+    cwd: &str,
+    runtime: crate::model::RuntimeKind,
+) -> Option<SessionInvalidationReason> {
+    session::session_invalidation_reason(existing, agent_id, work_id, cwd, runtime)
 }
 
 pub(crate) fn replay_snapshot_from_records(
@@ -86,6 +98,29 @@ pub(crate) fn replay_snapshot_from_records(
     records: &[crate::model::TransitionRecord],
 ) -> Result<WorkSnapshot, replay::ReplayError> {
     replay::replay_snapshot_from_records(base, records)
+}
+
+pub(crate) fn replay_base_snapshot(snapshot: &WorkSnapshot) -> WorkSnapshot {
+    replay::replay_base_snapshot(snapshot)
+}
+
+pub(crate) fn replay_snapshot_mismatch(
+    record_id: Option<crate::model::RecordId>,
+    message: &str,
+) -> ReplayError {
+    replay::replay_snapshot_mismatch(record_id, message)
+}
+
+pub(crate) fn timeout_requeue_transition(
+    snapshot: &WorkSnapshot,
+    run_id: &str,
+    lease_id: &crate::model::LeaseId,
+    reaped_at: crate::model::Timestamp,
+) -> (
+    crate::model::TransitionDecision,
+    crate::model::TransitionRecord,
+) {
+    reaper::timeout_requeue_transition(snapshot, run_id, lease_id, reaped_at)
 }
 
 #[cfg(test)]

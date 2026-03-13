@@ -1,8 +1,8 @@
 use crate::{
+    kernel,
     model::{
-        ActorId, ActorKind, DecisionOutcome, EvidenceBundle, EvidenceInline, GateResult,
-        LeaseEffect, LeaseId, PendingWakeEffect, RecordId, TransitionDecision, TransitionKind,
-        TransitionRecord, WorkPatch, WorkSnapshot, WorkStatus,
+        DecisionOutcome, EvidenceInline, GateResult, LeaseId, Timestamp, TransitionRecord,
+        WorkPatch, WorkSnapshot,
     },
     port::store::{
         ActivityEntryView, BoardGateFailureView, BoardTransitionView, CommitDecisionReq,
@@ -92,56 +92,22 @@ pub(crate) fn timeout_requeue_commit_req(
     lease_id: &LeaseId,
     reaped_at: crate::model::Timestamp,
 ) -> CommitDecisionReq {
-    let next_snapshot = WorkSnapshot {
-        status: WorkStatus::Todo,
-        assignee_agent_id: None,
-        active_lease_id: None,
-        rev: snapshot.rev + 1,
-        updated_at: reaped_at,
-        ..snapshot.clone()
-    };
-    let summary = format!(
-        "{:?} {:?} with next status {:?}",
-        TransitionKind::TimeoutRequeue,
-        DecisionOutcome::Accepted,
-        WorkStatus::Todo
-    );
+    let (decision, record) =
+        kernel::timeout_requeue_transition(snapshot, run_id, lease_id, reaped_at);
 
-    CommitDecisionReq {
-        decision: TransitionDecision {
-            outcome: DecisionOutcome::Accepted,
-            reasons: Vec::new(),
-            next_snapshot: Some(next_snapshot),
-            lease_effect: LeaseEffect::Release,
-            pending_wake_effect: PendingWakeEffect::Retain,
-            gate_results: Vec::new(),
-            evidence: EvidenceBundle::default(),
-            summary: summary.clone(),
-        },
-        record: TransitionRecord {
-            record_id: RecordId::from(format!("record-{run_id}-timeout")),
-            company_id: snapshot.company_id.clone(),
-            work_id: snapshot.work_id.clone(),
-            actor_kind: ActorKind::System,
-            actor_id: ActorId::from("system"),
-            lease_id: Some(lease_id.clone()),
-            expected_rev: snapshot.rev,
-            before_status: snapshot.status,
-            after_status: Some(WorkStatus::Todo),
-            outcome: DecisionOutcome::Accepted,
-            reasons: Vec::new(),
-            kind: TransitionKind::TimeoutRequeue,
-            patch: WorkPatch {
-                summary: format!("timed out run {run_id}"),
-                resolved_obligations: Vec::new(),
-                declared_risks: Vec::new(),
-            },
-            gate_results: Vec::new(),
-            evidence: EvidenceBundle::default(),
-            evidence_inline: Some(EvidenceInline { summary }),
-            evidence_refs: Vec::new(),
-            happened_at: reaped_at,
-        },
-        session: None,
+    CommitDecisionReq::new(decision, record, None)
+}
+
+pub(crate) fn with_authoritative_commit_timestamp(
+    mut req: CommitDecisionReq,
+    happened_at: Timestamp,
+) -> CommitDecisionReq {
+    req.context.record.happened_at = happened_at;
+    if let Some(snapshot) = req.decision.next_snapshot.as_mut() {
+        snapshot.updated_at = happened_at;
     }
+    if let Some(session) = req.effects.session.as_mut() {
+        session.updated_at = happened_at;
+    }
+    req
 }

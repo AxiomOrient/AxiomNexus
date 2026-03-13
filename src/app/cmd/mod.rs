@@ -21,6 +21,7 @@ pub(crate) mod create_contract_draft;
 pub(crate) mod create_work;
 pub(crate) mod resume_session;
 pub(crate) mod run_scheduler;
+pub(crate) mod run_turn_once;
 pub(crate) mod set_agent_status;
 pub(crate) mod submit_intent;
 pub(crate) mod update_work;

@@ -37,21 +37,32 @@ pub(crate) fn handle_submit_intent(
 ) -> Result<SubmitIntentAck, StoreError> {
     let context = store.load_context(&cmd.intent.work_id)?;
     let evidence = collect_decision_evidence(store, workspace, &context, &cmd.intent)?;
+    commit_runtime_intent(store, &context, &cmd.intent, evidence)
+}
+
+pub(crate) fn commit_runtime_intent(
+    store: &impl CommandStorePort,
+    context: &crate::port::store::WorkContext,
+    intent: &TransitionIntent,
+    evidence: EvidenceBundle,
+) -> Result<SubmitIntentAck, StoreError> {
+    let session_key = SessionKey {
+        agent_id: intent.agent_id.clone(),
+        work_id: intent.work_id.clone(),
+    };
+    let existing_session = store.load_session(&session_key)?;
     let decision = kernel::decide_transition(
         &context.snapshot,
         context.lease.as_ref(),
         context.pending_wake.as_ref(),
         &context.contract,
         &evidence,
-        &cmd.intent,
+        intent,
     );
-    let record = record_from_decision(&context, &cmd.intent, &decision);
-    let session = session_from_decision(store, &cmd.intent, &context.contract, &record, &decision)?;
-    let committed = store.commit_decision(CommitDecisionReq {
-        decision: decision.clone(),
-        record,
-        session,
-    })?;
+    let record = record_from_decision(context, intent, &decision, existing_session.as_ref());
+    let session = session_from_decision(existing_session, &context.contract, &record, &decision);
+    let committed =
+        store.commit_decision(CommitDecisionReq::new(decision.clone(), record, session))?;
 
     Ok(SubmitIntentAck {
         decision_path: DECISION_PATH,
@@ -66,7 +77,7 @@ pub(crate) fn handle_submit_intent(
     })
 }
 
-fn collect_decision_evidence(
+pub(crate) fn collect_decision_evidence(
     store: &impl CommandStorePort,
     workspace: &impl WorkspacePort,
     context: &crate::port::store::WorkContext,
@@ -80,8 +91,13 @@ fn collect_decision_evidence(
         .filter(|hint| hint.kind == ProofHintKind::File)
         .map(|hint| hint.value.clone())
         .collect::<Vec<_>>();
+    let changed_files = if hinted_paths.is_empty() {
+        Vec::new()
+    } else {
+        workspace.observe_changed_files(&cwd, &hinted_paths)
+    };
     let mut evidence = EvidenceBundle {
-        changed_files: workspace.observe_changed_files(&cwd, &hinted_paths),
+        changed_files,
         observed_agent_status,
         observed_agent_company_id,
         ..EvidenceBundle::default()
@@ -115,7 +131,7 @@ fn collect_decision_evidence(
     Ok(evidence)
 }
 
-fn observed_agent_facts(
+pub(crate) fn observed_agent_facts(
     store: &impl CommandStorePort,
     intent: &TransitionIntent,
 ) -> Result<
@@ -132,7 +148,7 @@ fn observed_agent_facts(
     ))
 }
 
-fn gate_command_cwd(
+pub(crate) fn gate_command_cwd(
     store: &impl CommandStorePort,
     workspace: &impl WorkspacePort,
     intent: &TransitionIntent,
@@ -155,6 +171,7 @@ fn record_from_decision(
     context: &crate::port::store::WorkContext,
     intent: &TransitionIntent,
     decision: &crate::model::TransitionDecision,
+    existing_session: Option<&TaskSession>,
 ) -> TransitionRecord {
     TransitionRecord {
         record_id: RecordId::from(format!(
@@ -167,8 +184,15 @@ fn record_from_decision(
         work_id: intent.work_id.clone(),
         actor_kind: actor_kind_for(intent.kind),
         actor_id: actor_id_for(intent.kind, intent),
+        run_id: context
+            .lease
+            .as_ref()
+            .and_then(|lease| lease.run_id.clone()),
+        session_id: existing_session.map(|session| session.session_id.clone()),
         lease_id: context.lease.as_ref().map(|lease| lease.lease_id.clone()),
         expected_rev: intent.expected_rev,
+        contract_set_id: context.snapshot.contract_set_id.clone(),
+        contract_rev: context.snapshot.contract_rev,
         before_status: context.snapshot.status,
         after_status: decision
             .next_snapshot
@@ -189,20 +213,12 @@ fn record_from_decision(
 }
 
 fn session_from_decision(
-    store: &impl CommandStorePort,
-    intent: &TransitionIntent,
+    existing: Option<TaskSession>,
     contract: &crate::model::ContractSet,
     record: &TransitionRecord,
     decision: &crate::model::TransitionDecision,
-) -> Result<Option<TaskSession>, StoreError> {
-    let key = SessionKey {
-        agent_id: intent.agent_id.clone(),
-        work_id: intent.work_id.clone(),
-    };
-    let existing = store.load_session(&key)?;
-    let Some(existing) = existing else {
-        return Ok(None);
-    };
+) -> Option<TaskSession> {
+    let existing = existing?;
 
     let mut candidate = existing.clone();
     candidate.contract_rev = contract.revision;
@@ -219,11 +235,7 @@ fn session_from_decision(
         }
     }
 
-    Ok(Some(kernel::advance_session(
-        Some(&existing),
-        candidate,
-        false,
-    )))
+    Some(kernel::advance_session(Some(&existing), candidate, None))
 }
 
 fn actor_kind_for(kind: crate::model::TransitionKind) -> ActorKind {
@@ -250,24 +262,61 @@ fn actor_id_for(kind: crate::model::TransitionKind, intent: &TransitionIntent) -
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::Cell, path::Path, rc::Rc};
+
     use crate::{
-        adapter::memory::store::{
-            MemoryStore, DEMO_AGENT_ID, DEMO_COMPANY_ID, DEMO_CONTRACT_SET_ID, DEMO_DOING_WORK_ID,
-            DEMO_LEASE_ID,
+        adapter::{
+            coclai::{
+                assets::RuntimeAssets,
+                runtime::{CoclaiRuntime, ScriptedReply},
+            },
+            memory::store::{
+                MemoryStore, DEMO_AGENT_ID, DEMO_COMPANY_ID, DEMO_CONTRACT_SET_ID,
+                DEMO_DOING_WORK_ID, DEMO_LEASE_ID,
+            },
+            surreal::store::SurrealStore,
+        },
+        app::cmd::{
+            activate_contract::{handle_activate_contract, ActivateContractCmd},
+            claim_work::{handle_claim_work, ClaimWorkCmd},
+            create_agent::{handle_create_agent, CreateAgentCmd},
+            create_company::{handle_create_company, CreateCompanyCmd},
+            create_contract_draft::{handle_create_contract_draft, CreateContractDraftCmd},
+            create_work::{handle_create_work, CreateWorkCmd},
+            resume_session::{handle_resume_session, ResumeSessionCmd},
         },
         model::{
-            AgentId, ChangeKind, CommandResult, CompanyId, ContractSet, ContractSetId,
-            ContractSetStatus, FileChange, GateSpec, LeaseId, Priority, RuntimeKind, SessionId,
-            TaskSession, TransitionIntent, TransitionKind, TransitionRule, WorkId, WorkKind,
-            WorkLease, WorkPatch, WorkSnapshot, WorkStatus,
+            workspace_fingerprint, ActorKind, AgentId, ChangeKind, CommandResult, CompanyId,
+            ContractSet, ContractSetId, ContractSetStatus, DecisionOutcome, FileChange, GateSpec,
+            LeaseEffect, LeaseId, Priority, RuntimeKind, SessionId, TaskSession, TransitionIntent,
+            TransitionKind, TransitionRule, WorkId, WorkKind, WorkLease, WorkPatch, WorkSnapshot,
+            WorkStatus,
         },
         port::{
+            runtime::RuntimeHandle,
             store::{SessionKey, StorePort, WorkContext},
             workspace::{WorkspaceError, WorkspacePort},
         },
     };
 
     use super::{collect_decision_evidence, handle_submit_intent, SubmitIntentCmd};
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct FlowSummary {
+        final_status: WorkStatus,
+        final_rev: u64,
+        replay_matches_live: bool,
+        record_summaries: Vec<FlowRecordSummary>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct FlowRecordSummary {
+        kind: TransitionKind,
+        outcome: DecisionOutcome,
+        expected_rev: u64,
+        before_status: WorkStatus,
+        after_status: Option<WorkStatus>,
+    }
 
     #[test]
     fn accepted_submit_intent_updates_session_decision_summary() {
@@ -468,11 +517,131 @@ mod tests {
         assert!(evidence.changed_files.is_empty());
     }
 
+    #[test]
+    fn collect_decision_evidence_skips_workspace_io_without_required_subset() {
+        let store = MemoryStore::demo();
+        seed_session_at_cwd(&store, Some("accepted earlier"), None, "/repo");
+        let workspace = TestWorkspace::default();
+        let observe_calls = workspace.observe_changed_files_calls.clone();
+        let command_calls = workspace.run_gate_command_calls.clone();
+        let context = progress_context_without_workspace_gates();
+        let intent = TransitionIntent {
+            work_id: WorkId::from(DEMO_DOING_WORK_ID),
+            agent_id: AgentId::from(DEMO_AGENT_ID),
+            lease_id: LeaseId::from(DEMO_LEASE_ID),
+            expected_rev: 1,
+            kind: TransitionKind::ProposeProgress,
+            patch: WorkPatch {
+                summary: "progress only".to_owned(),
+                resolved_obligations: Vec::new(),
+                declared_risks: Vec::new(),
+            },
+            note: None,
+            proof_hints: vec![crate::model::ProofHint {
+                kind: crate::model::ProofHintKind::Summary,
+                value: "progress only".to_owned(),
+            }],
+        };
+
+        let evidence = collect_decision_evidence(&store, &workspace, &context, &intent)
+            .expect("evidence should collect");
+
+        assert!(evidence.changed_files.is_empty());
+        assert!(evidence.command_results.is_empty());
+        assert_eq!(observe_calls.get(), 0);
+        assert_eq!(command_calls.get(), 0);
+    }
+
+    #[test]
+    fn memory_queue_turn_commit_replay_flow_stays_consistent() {
+        let store = MemoryStore::demo();
+        let created = handle_create_work(
+            &store,
+            CreateWorkCmd {
+                company_id: CompanyId::from(DEMO_COMPANY_ID),
+                parent_id: None,
+                kind: WorkKind::Task,
+                title: "Memory replay flow".to_owned(),
+                body: "Exercise queue -> turn -> commit -> replay".to_owned(),
+                contract_set_id: ContractSetId::from(DEMO_CONTRACT_SET_ID),
+            },
+        )
+        .expect("work should create");
+        let work_id = WorkId::from(created.work_id.as_str());
+        let summary = execute_runtime_flow(
+            &store,
+            &work_id,
+            &AgentId::from(DEMO_AGENT_ID),
+            "queued for runtime",
+        );
+
+        assert!(summary.replay_matches_live);
+        assert_eq!(summary.record_summaries.len(), 3);
+        assert_eq!(summary.record_summaries[0].kind, TransitionKind::Queue);
+        assert_eq!(summary.record_summaries[1].kind, TransitionKind::Claim);
+        assert_eq!(
+            summary.record_summaries[2].kind,
+            TransitionKind::ProposeProgress
+        );
+    }
+
+    #[test]
+    fn surreal_queue_turn_commit_replay_flow_stays_consistent() {
+        let (store, work_id, agent_id) =
+            setup_surreal_runtime_flow_fixture("submit-intent-live-flow");
+        let summary = execute_runtime_flow(&store, &work_id, &agent_id, "queued for live runtime");
+
+        assert!(summary.replay_matches_live);
+        assert_eq!(summary.record_summaries.len(), 3);
+        assert_eq!(summary.record_summaries[0].kind, TransitionKind::Queue);
+        assert_eq!(summary.record_summaries[1].kind, TransitionKind::Claim);
+        assert_eq!(
+            summary.record_summaries[2].kind,
+            TransitionKind::ProposeProgress
+        );
+    }
+
+    #[test]
+    fn runtime_flow_parity_matches_between_memory_and_surreal() {
+        let memory_store = MemoryStore::demo();
+        let memory_created = handle_create_work(
+            &memory_store,
+            CreateWorkCmd {
+                company_id: CompanyId::from(DEMO_COMPANY_ID),
+                parent_id: None,
+                kind: WorkKind::Task,
+                title: "Memory parity flow".to_owned(),
+                body: "Compare runtime parity".to_owned(),
+                contract_set_id: ContractSetId::from(DEMO_CONTRACT_SET_ID),
+            },
+        )
+        .expect("memory work should create");
+        let memory_summary = execute_runtime_flow(
+            &memory_store,
+            &WorkId::from(memory_created.work_id.as_str()),
+            &AgentId::from(DEMO_AGENT_ID),
+            "queued for parity",
+        );
+
+        let (surreal_store, surreal_work_id, surreal_agent_id) =
+            setup_surreal_runtime_flow_fixture("submit-intent-parity-flow");
+        let surreal_summary = execute_runtime_flow(
+            &surreal_store,
+            &surreal_work_id,
+            &surreal_agent_id,
+            "queued for parity",
+        );
+
+        assert_eq!(memory_summary, surreal_summary);
+    }
+
     #[derive(Debug, Clone)]
     struct TestWorkspace {
         current_dir: String,
         changed_files: Vec<FileChange>,
         command_result: CommandResult,
+        observe_changed_files_calls: Rc<Cell<u32>>,
+        run_gate_command_calls: Rc<Cell<u32>>,
     }
 
     impl Default for TestWorkspace {
@@ -487,6 +656,8 @@ mod tests {
                     stderr: String::new(),
                     failure_detail: None,
                 },
+                observe_changed_files_calls: Rc::new(Cell::new(0)),
+                run_gate_command_calls: Rc::new(Cell::new(0)),
             }
         }
     }
@@ -501,6 +672,8 @@ mod tests {
         }
 
         fn observe_changed_files(&self, _cwd: &str, hinted_paths: &[String]) -> Vec<FileChange> {
+            self.observe_changed_files_calls
+                .set(self.observe_changed_files_calls.get() + 1);
             self.changed_files
                 .iter()
                 .filter(|change| hinted_paths.iter().any(|path| path == &change.path))
@@ -514,6 +687,8 @@ mod tests {
             _argv: &[String],
             _timeout: std::time::Duration,
         ) -> CommandResult {
+            self.run_gate_command_calls
+                .set(self.run_gate_command_calls.get() + 1);
             self.command_result.clone()
         }
     }
@@ -537,6 +712,7 @@ mod tests {
                 runtime: RuntimeKind::Coclai,
                 runtime_session_id: "runtime-1".to_owned(),
                 cwd: cwd.to_owned(),
+                workspace_fingerprint: workspace_fingerprint(cwd),
                 contract_rev: 1,
                 last_record_id: None,
                 last_decision_summary: decision.map(str::to_owned),
@@ -626,5 +802,329 @@ mod tests {
                 }],
             },
         }
+    }
+
+    fn progress_context_without_workspace_gates() -> WorkContext {
+        WorkContext {
+            snapshot: WorkSnapshot {
+                work_id: WorkId::from(DEMO_DOING_WORK_ID),
+                company_id: CompanyId::from(DEMO_COMPANY_ID),
+                parent_id: None,
+                kind: WorkKind::Task,
+                title: "Doing work".to_owned(),
+                body: String::new(),
+                status: WorkStatus::Doing,
+                priority: Priority::High,
+                assignee_agent_id: Some(AgentId::from(DEMO_AGENT_ID)),
+                active_lease_id: Some(LeaseId::from(DEMO_LEASE_ID)),
+                rev: 1,
+                contract_set_id: ContractSetId::from(DEMO_CONTRACT_SET_ID),
+                contract_rev: 1,
+                created_at: std::time::SystemTime::UNIX_EPOCH,
+                updated_at: std::time::SystemTime::UNIX_EPOCH,
+            },
+            lease: Some(WorkLease {
+                lease_id: LeaseId::from(DEMO_LEASE_ID),
+                company_id: CompanyId::from(DEMO_COMPANY_ID),
+                work_id: WorkId::from(DEMO_DOING_WORK_ID),
+                agent_id: AgentId::from(DEMO_AGENT_ID),
+                run_id: None,
+                acquired_at: std::time::SystemTime::UNIX_EPOCH,
+                expires_at: None,
+                released_at: None,
+                release_reason: None,
+            }),
+            pending_wake: None,
+            contract: ContractSet {
+                contract_set_id: ContractSetId::from(DEMO_CONTRACT_SET_ID),
+                company_id: CompanyId::from(DEMO_COMPANY_ID),
+                revision: 1,
+                name: "axiomnexus-rust-default".to_owned(),
+                status: ContractSetStatus::Active,
+                rules: vec![TransitionRule {
+                    kind: TransitionKind::ProposeProgress,
+                    actor_kind: crate::model::ActorKind::Agent,
+                    from: vec![WorkStatus::Doing],
+                    to: WorkStatus::Doing,
+                    lease_effect: crate::model::LeaseEffect::Keep,
+                    gates: vec![
+                        GateSpec::LeasePresent,
+                        GateSpec::LeaseHeldByActor,
+                        GateSpec::ExpectedRevMatchesSnapshot,
+                        GateSpec::SummaryPresent,
+                    ],
+                }],
+            },
+        }
+    }
+
+    fn execute_runtime_flow(
+        store: &impl StorePort,
+        work_id: &WorkId,
+        agent_id: &AgentId,
+        queue_summary: &str,
+    ) -> FlowSummary {
+        let queued = handle_submit_intent(
+            store,
+            &TestWorkspace::default(),
+            SubmitIntentCmd {
+                intent: TransitionIntent {
+                    work_id: work_id.clone(),
+                    agent_id: agent_id.clone(),
+                    lease_id: LeaseId::from("lease-unused"),
+                    expected_rev: 0,
+                    kind: TransitionKind::Queue,
+                    patch: WorkPatch {
+                        summary: queue_summary.to_owned(),
+                        resolved_obligations: Vec::new(),
+                        declared_risks: Vec::new(),
+                    },
+                    note: None,
+                    proof_hints: vec![crate::model::ProofHint {
+                        kind: crate::model::ProofHintKind::Summary,
+                        value: queue_summary.to_owned(),
+                    }],
+                },
+            },
+        )
+        .expect("queue should commit");
+        assert_eq!(queued.outcome, DecisionOutcome::Accepted);
+
+        let claimed = handle_claim_work(
+            store,
+            ClaimWorkCmd {
+                work_id: work_id.clone(),
+                agent_id: agent_id.clone(),
+            },
+        )
+        .expect("claim should succeed");
+        assert_eq!(claimed.snapshot_status, WorkStatus::Doing);
+
+        let context = store.load_context(work_id).expect("context should load");
+        let lease = context.lease.expect("claimed work should expose lease");
+        let run_id = lease.run_id.clone().expect("claim should attach run");
+        let runtime = scripted_runtime_reply(work_id, agent_id, context.snapshot.rev);
+
+        let resumed = handle_resume_session(
+            store,
+            &runtime,
+            ResumeSessionCmd {
+                run_id,
+                cwd: "/repo".to_owned(),
+            },
+        )
+        .expect("turn should save session");
+        assert_eq!(
+            resumed.runtime_policy,
+            crate::app::cmd::RUNTIME_RESUME_POLICY
+        );
+        assert!(!resumed.resumed);
+
+        let committed = handle_submit_intent(
+            store,
+            &TestWorkspace::default(),
+            SubmitIntentCmd {
+                intent: runtime_intent(work_id, agent_id, &lease.lease_id, context.snapshot.rev),
+            },
+        )
+        .expect("runtime submit should commit");
+        assert_eq!(committed.outcome, DecisionOutcome::Accepted);
+
+        let live = store
+            .load_context(work_id)
+            .expect("live context should load after commit")
+            .snapshot;
+        let records = store
+            .load_transition_records(work_id)
+            .expect("transition records should load");
+        let replayed = crate::kernel::replay_snapshot_from_records(
+            &crate::kernel::replay_base_snapshot(&live),
+            &records,
+        )
+        .expect("replay should succeed");
+
+        FlowSummary {
+            final_status: live.status,
+            final_rev: live.rev,
+            replay_matches_live: replayed == live,
+            record_summaries: records
+                .into_iter()
+                .map(|record| FlowRecordSummary {
+                    kind: record.kind,
+                    outcome: record.outcome,
+                    expected_rev: record.expected_rev,
+                    before_status: record.before_status,
+                    after_status: record.after_status,
+                })
+                .collect(),
+        }
+    }
+
+    fn runtime_intent(
+        work_id: &WorkId,
+        agent_id: &AgentId,
+        lease_id: &LeaseId,
+        expected_rev: u64,
+    ) -> TransitionIntent {
+        TransitionIntent {
+            work_id: work_id.clone(),
+            agent_id: agent_id.clone(),
+            lease_id: lease_id.clone(),
+            expected_rev,
+            kind: TransitionKind::ProposeProgress,
+            patch: WorkPatch {
+                summary: "runtime progress".to_owned(),
+                resolved_obligations: Vec::new(),
+                declared_risks: Vec::new(),
+            },
+            note: None,
+            proof_hints: vec![crate::model::ProofHint {
+                kind: crate::model::ProofHintKind::Summary,
+                value: "runtime progress".to_owned(),
+            }],
+        }
+    }
+
+    fn scripted_runtime_reply(
+        work_id: &WorkId,
+        agent_id: &AgentId,
+        expected_rev: u64,
+    ) -> CoclaiRuntime {
+        let assets = RuntimeAssets::load_from_repo_root(Path::new(env!("CARGO_MANIFEST_DIR")))
+            .expect("assets should load");
+        let runtime_lease_id = LeaseId::from("33333333-3333-4333-8333-333333333333");
+        let intent = runtime_intent(work_id, agent_id, &runtime_lease_id, expected_rev);
+        let raw_output = format!(
+            "{{\"work_id\":\"{}\",\"agent_id\":\"{}\",\"lease_id\":\"{}\",\"expected_rev\":{},\"kind\":\"propose_progress\",\"patch\":{{\"summary\":\"runtime progress\",\"resolved_obligations\":[],\"declared_risks\":[]}},\"note\":null,\"proof_hints\":[{{\"kind\":\"summary\",\"value\":\"runtime progress\"}}]}}",
+            work_id,
+            agent_id,
+            runtime_lease_id,
+            expected_rev
+        );
+
+        CoclaiRuntime::with_scripted_replies(
+            assets,
+            vec![ScriptedReply {
+                handle: RuntimeHandle {
+                    runtime_session_id: "runtime-memory-flow".to_owned(),
+                },
+                raw_output,
+                intent,
+                usage: crate::model::ConsumptionUsage {
+                    input_tokens: 120,
+                    output_tokens: 48,
+                    run_seconds: 3,
+                    estimated_cost_cents: Some(7),
+                },
+                invalid_session: false,
+            }],
+        )
+    }
+
+    fn runtime_flow_rules() -> Vec<TransitionRule> {
+        vec![
+            TransitionRule {
+                kind: TransitionKind::Queue,
+                actor_kind: ActorKind::Board,
+                from: vec![WorkStatus::Backlog],
+                to: WorkStatus::Todo,
+                lease_effect: LeaseEffect::None,
+                gates: Vec::new(),
+            },
+            TransitionRule {
+                kind: TransitionKind::Claim,
+                actor_kind: ActorKind::Agent,
+                from: vec![WorkStatus::Todo],
+                to: WorkStatus::Doing,
+                lease_effect: LeaseEffect::Acquire,
+                gates: vec![GateSpec::NoOpenLease, GateSpec::AgentIsRunnable],
+            },
+            TransitionRule {
+                kind: TransitionKind::ProposeProgress,
+                actor_kind: ActorKind::Agent,
+                from: vec![WorkStatus::Doing],
+                to: WorkStatus::Doing,
+                lease_effect: LeaseEffect::Keep,
+                gates: vec![
+                    GateSpec::LeasePresent,
+                    GateSpec::LeaseHeldByActor,
+                    GateSpec::ExpectedRevMatchesSnapshot,
+                    GateSpec::SummaryPresent,
+                ],
+            },
+        ]
+    }
+
+    fn new_surreal_store(label: &str) -> SurrealStore {
+        SurrealStore::open(&new_surreal_store_url(label)).expect("surreal store should open")
+    }
+
+    fn setup_surreal_runtime_flow_fixture(label: &str) -> (SurrealStore, WorkId, AgentId) {
+        let store = new_surreal_store(label);
+        let company = handle_create_company(
+            &store,
+            CreateCompanyCmd {
+                name: "Surreal Co".to_owned(),
+                description: "live runtime scenario".to_owned(),
+                runtime_hard_stop_cents: None,
+            },
+        )
+        .expect("company should create");
+        let company_id = CompanyId::from(company.company_id.as_str());
+        let agent = handle_create_agent(
+            &store,
+            CreateAgentCmd {
+                company_id: company_id.clone(),
+                name: "Live Agent".to_owned(),
+                role: "builder".to_owned(),
+            },
+        )
+        .expect("agent should create");
+        let agent_id = AgentId::from(agent.agent_id.as_str());
+        let draft = handle_create_contract_draft(
+            &store,
+            CreateContractDraftCmd {
+                company_id: company_id.clone(),
+                name: "live-runtime".to_owned(),
+                rules: runtime_flow_rules(),
+            },
+        )
+        .expect("draft should create");
+        handle_activate_contract(
+            &store,
+            ActivateContractCmd {
+                company_id: company_id.clone(),
+                revision: draft.revision,
+            },
+        )
+        .expect("contract should activate");
+
+        let contract_set_id = ContractSetId::from(store.read_contracts().contract_set_id.as_str());
+        let created = handle_create_work(
+            &store,
+            CreateWorkCmd {
+                company_id,
+                parent_id: None,
+                kind: WorkKind::Task,
+                title: "Surreal replay flow".to_owned(),
+                body: "Exercise queue -> turn -> commit -> replay on live store".to_owned(),
+                contract_set_id,
+            },
+        )
+        .expect("work should create");
+
+        (store, WorkId::from(created.work_id.as_str()), agent_id)
+    }
+
+    fn new_surreal_store_url(label: &str) -> String {
+        format!(
+            "surrealkv://{}/axiomnexus-submit-intent-{}-{}",
+            std::env::temp_dir().display(),
+            label,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or(std::time::Duration::from_secs(0))
+                .as_nanos()
+        )
     }
 }

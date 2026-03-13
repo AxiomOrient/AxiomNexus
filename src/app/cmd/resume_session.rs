@@ -1,7 +1,11 @@
 use serde::Serialize;
 
 use crate::{
-    model::{BillingKind, RunId, RuntimeKind, SessionId, TaskSession, TransitionKind},
+    kernel,
+    model::{
+        workspace_fingerprint, BillingKind, RunId, RuntimeKind, SessionId, TaskSession,
+        TransitionIntent, TransitionKind,
+    },
     port::{
         runtime::{ExecuteTurnReq, RuntimePort},
         store::{
@@ -23,7 +27,10 @@ pub(crate) struct ResumeSessionAck {
     pub(crate) runtime_policy: &'static str,
     pub(crate) resumed: bool,
     pub(crate) repair_count: u8,
+    pub(crate) session_reset_reason: Option<crate::model::SessionInvalidationReason>,
     pub(crate) runtime_session_id: String,
+    #[serde(skip_serializing)]
+    pub(crate) intent: TransitionIntent,
     pub(crate) intent_kind: TransitionKind,
 }
 
@@ -39,19 +46,43 @@ pub(crate) fn handle_resume_session(
         work_id: turn.snapshot.work_id.clone(),
     };
     let existing_session = store.load_session(&session_key)?;
-    let prompt_input = prompt_input_for(&turn, existing_session.as_ref());
-    let outcome = runtime
-        .execute_turn(ExecuteTurnReq {
-            session_key,
-            cwd: cwd.clone(),
-            existing_session: existing_session.clone(),
-            prompt_input,
-        })
-        .map_err(runtime_error_to_store_error)?;
+    let local_reset_reason = existing_session.as_ref().and_then(|session| {
+        kernel::session_invalidation_reason(
+            session,
+            &turn.agent_id,
+            &turn.snapshot.work_id,
+            &cwd,
+            RuntimeKind::Coclai,
+        )
+    });
+    let resume_session = if local_reset_reason.is_none() {
+        existing_session.clone()
+    } else {
+        None
+    };
+    let prompt_input = prompt_input_for(&turn, resume_session.as_ref());
+    let outcome = match runtime.execute_turn(ExecuteTurnReq {
+        session_key,
+        cwd: cwd.clone(),
+        existing_session: resume_session.clone(),
+        prompt_input,
+    }) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            store.mark_run_failed(&turn.run_id, "runtime_failure")?;
+            return Err(runtime_error_to_store_error(error));
+        }
+    };
+    let session_reset_reason = local_reset_reason.or(outcome.session_reset_reason);
+    let session_base = if session_reset_reason.is_none() {
+        resume_session.as_ref()
+    } else {
+        None
+    };
 
     store.save_session(&session_from_turn(
         &turn,
-        existing_session.as_ref(),
+        session_base,
         &outcome.handle.runtime_session_id,
         &cwd,
     ))?;
@@ -64,12 +95,16 @@ pub(crate) fn handle_resume_session(
         usage: outcome.result.usage.clone(),
     })?;
 
+    let intent_kind = outcome.result.intent.kind;
+
     Ok(ResumeSessionAck {
         runtime_policy: RUNTIME_RESUME_POLICY,
         resumed: outcome.resumed,
         repair_count: outcome.repair_count,
+        session_reset_reason,
         runtime_session_id: outcome.handle.runtime_session_id,
-        intent_kind: outcome.result.intent.kind,
+        intent: outcome.result.intent,
+        intent_kind,
     })
 }
 
@@ -112,6 +147,7 @@ fn session_from_turn(
         runtime: RuntimeKind::Coclai,
         runtime_session_id: runtime_session_id.to_owned(),
         cwd: cwd.to_owned(),
+        workspace_fingerprint: workspace_fingerprint(cwd),
         contract_rev: turn.contract.revision,
         last_record_id: existing_session.and_then(|session| session.last_record_id.clone()),
         last_decision_summary: existing_session
@@ -141,8 +177,9 @@ mod tests {
             memory::store::{MemoryStore, DEMO_AGENT_ID, DEMO_DOING_WORK_ID},
         },
         model::{
-            AgentId, CompanyId, ConsumptionUsage, LeaseId, RuntimeKind, SessionId, TaskSession,
-            TransitionIntent, TransitionKind, WorkId, WorkPatch,
+            workspace_fingerprint, AgentId, CompanyId, ConsumptionUsage, LeaseId, RunId,
+            RuntimeKind, SessionId, SessionInvalidationReason, TaskSession, TransitionIntent,
+            TransitionKind, WorkId, WorkPatch,
         },
         port::{
             runtime::RuntimeHandle,
@@ -254,6 +291,7 @@ mod tests {
                 runtime: RuntimeKind::Coclai,
                 runtime_session_id: "runtime-existing".to_owned(),
                 cwd: "/repo".to_owned(),
+                workspace_fingerprint: workspace_fingerprint("/repo"),
                 contract_rev: 1,
                 last_record_id: None,
                 last_decision_summary: Some("accepted earlier".to_owned()),
@@ -274,6 +312,138 @@ mod tests {
 
         assert!(ack.resumed);
         assert_eq!(ack.intent_kind, TransitionKind::Complete);
+        assert_eq!(ack.session_reset_reason, None);
+    }
+
+    #[test]
+    fn resume_session_resets_when_workspace_changes() {
+        let assets = RuntimeAssets::load_from_repo_root(Path::new(env!("CARGO_MANIFEST_DIR")))
+            .expect("assets should load");
+        let runtime = CoclaiRuntime::with_scripted_replies(
+            assets,
+            vec![ScriptedReply {
+                handle: RuntimeHandle {
+                    runtime_session_id: "runtime-new-workspace".to_owned(),
+                },
+                raw_output: valid_output("complete"),
+                intent: intent(TransitionKind::Complete),
+                usage: usage(),
+                invalid_session: false,
+            }],
+        );
+        let store = MemoryStore::demo();
+        store
+            .save_session(&TaskSession {
+                session_id: SessionId::from("session-existing"),
+                company_id: CompanyId::from("00000000-0000-4000-8000-000000000001"),
+                agent_id: AgentId::from(DEMO_AGENT_ID),
+                work_id: WorkId::from(DEMO_DOING_WORK_ID),
+                runtime: RuntimeKind::Coclai,
+                runtime_session_id: "runtime-existing".to_owned(),
+                cwd: "/old-repo".to_owned(),
+                workspace_fingerprint: workspace_fingerprint("/old-repo"),
+                contract_rev: 1,
+                last_record_id: None,
+                last_decision_summary: Some("accepted earlier".to_owned()),
+                last_gate_summary: Some("gate ok".to_owned()),
+                updated_at: SystemTime::UNIX_EPOCH,
+            })
+            .expect("session seed should save");
+
+        let ack = handle_resume_session(
+            &store,
+            &runtime,
+            ResumeSessionCmd {
+                run_id: crate::model::RunId::from("run-1"),
+                cwd: "/repo".to_owned(),
+            },
+        )
+        .expect("workspace mismatch should reset session");
+
+        let saved = store
+            .load_session(&SessionKey {
+                agent_id: AgentId::from(DEMO_AGENT_ID),
+                work_id: WorkId::from(DEMO_DOING_WORK_ID),
+            })
+            .expect("session lookup should work")
+            .expect("session should be saved");
+
+        assert!(!ack.resumed);
+        assert_eq!(
+            ack.session_reset_reason,
+            Some(SessionInvalidationReason::Workspace)
+        );
+        assert_eq!(saved.session_id, SessionId::from("session-run-1"));
+        assert_eq!(saved.runtime_session_id, "runtime-new-workspace");
+    }
+
+    #[test]
+    fn resume_session_marks_run_failed_with_runtime_failure_activity() {
+        let assets = RuntimeAssets::load_from_repo_root(Path::new(env!("CARGO_MANIFEST_DIR")))
+            .expect("assets should load");
+        let runtime = CoclaiRuntime::with_scripted_replies(
+            assets,
+            vec![
+                ScriptedReply {
+                    handle: RuntimeHandle {
+                        runtime_session_id: "runtime-bad".to_owned(),
+                    },
+                    raw_output: "{\"kind\":\"complete\"}".to_owned(),
+                    intent: intent(TransitionKind::Complete),
+                    usage: usage(),
+                    invalid_session: false,
+                },
+                ScriptedReply {
+                    handle: RuntimeHandle {
+                        runtime_session_id: "runtime-bad".to_owned(),
+                    },
+                    raw_output: "{\"kind\":\"complete\"}".to_owned(),
+                    intent: intent(TransitionKind::Complete),
+                    usage: usage(),
+                    invalid_session: false,
+                },
+            ],
+        );
+        let store = MemoryStore::demo();
+        store
+            .merge_wake(crate::port::store::MergeWakeReq {
+                work_id: WorkId::from("00000000-0000-4000-8000-000000000011"),
+                actor_kind: crate::model::ActorKind::Board,
+                actor_id: crate::model::ActorId::from("board"),
+                source: "manual".to_owned(),
+                reason: "scheduler".to_owned(),
+                obligations: vec!["follow up".to_owned()],
+            })
+            .expect("wake should create queued run");
+
+        let error = handle_resume_session(
+            &store,
+            &runtime,
+            ResumeSessionCmd {
+                run_id: RunId::from("run-2"),
+                cwd: "/repo".to_owned(),
+            },
+        )
+        .expect_err("runtime failure should bubble up");
+
+        let run = store
+            .read_run(&RunId::from("run-2"))
+            .expect("run read should succeed");
+        let activity = store.read_activity();
+
+        assert_eq!(error.kind, crate::port::store::StoreErrorKind::Unavailable);
+        assert_eq!(run.status, "failed");
+        assert!(activity.entries.iter().any(|entry| {
+            entry.event_kind == "run"
+                && entry.source.as_deref() == Some("runtime")
+                && entry.outcome.as_deref() == Some("failed")
+                && entry.summary.contains("runtime_failure")
+        }));
+        assert!(!activity.entries.iter().any(|entry| {
+            entry.event_kind == "transition"
+                && entry.outcome.as_deref() == Some("rejected")
+                && entry.summary.contains("runtime_failure")
+        }));
     }
 
     fn intent(kind: TransitionKind) -> TransitionIntent {

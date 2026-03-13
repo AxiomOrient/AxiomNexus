@@ -44,11 +44,7 @@ pub(crate) fn handle_claim_work(
         DecisionOutcome::Accepted => {
             let happened_at = context.snapshot.updated_at + Duration::from_secs(1);
             let record = claim_record(&context, &intent, &decision, happened_at);
-            store.commit_decision(CommitDecisionReq {
-                decision: decision.clone(),
-                record,
-                session: None,
-            })?;
+            store.commit_decision(CommitDecisionReq::new(decision.clone(), record, None))?;
 
             Ok(ClaimWorkAck {
                 transition_path: DECISION_PATH,
@@ -62,11 +58,7 @@ pub(crate) fn handle_claim_work(
         DecisionOutcome::Rejected | DecisionOutcome::Conflict => {
             let happened_at = context.snapshot.updated_at + Duration::from_secs(1);
             let record = claim_record(&context, &intent, &decision, happened_at);
-            store.commit_decision(CommitDecisionReq {
-                decision: decision.clone(),
-                record,
-                session: None,
-            })?;
+            store.commit_decision(CommitDecisionReq::new(decision.clone(), record, None))?;
             Err(StoreError {
                 kind: StoreErrorKind::Conflict,
                 message: decision.summary,
@@ -122,8 +114,15 @@ fn claim_record(
         work_id: context.snapshot.work_id.clone(),
         actor_kind: ActorKind::Agent,
         actor_id: ActorId::from(intent.agent_id.as_str()),
+        run_id: context
+            .lease
+            .as_ref()
+            .and_then(|lease| lease.run_id.clone()),
+        session_id: None,
         lease_id: (decision.outcome == DecisionOutcome::Accepted).then(|| intent.lease_id.clone()),
         expected_rev: context.snapshot.rev,
+        contract_set_id: context.snapshot.contract_set_id.clone(),
+        contract_rev: context.snapshot.contract_rev,
         before_status: context.snapshot.status,
         after_status: decision
             .next_snapshot
@@ -220,6 +219,7 @@ mod tests {
             CreateCompanyCmd {
                 name: "No Claim Co".to_owned(),
                 description: "company without claim rule".to_owned(),
+                runtime_hard_stop_cents: None,
             },
         )
         .expect("company should create");
