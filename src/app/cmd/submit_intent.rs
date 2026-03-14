@@ -216,14 +216,9 @@ fn actor_id_for(kind: crate::model::TransitionKind, intent: &TransitionIntent) -
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use crate::{
         adapter::{
-            coclai::{
-                assets::RuntimeAssets,
-                runtime::{CoclaiRuntime, ScriptedReply},
-            },
+            coclai::runtime::{CoclaiRuntime, ScriptedReply},
             memory::store::{
                 MemoryStore, DEMO_AGENT_ID, DEMO_COMPANY_ID, DEMO_CONTRACT_SET_ID,
                 DEMO_DOING_WORK_ID, DEMO_LEASE_ID,
@@ -238,6 +233,9 @@ mod tests {
             create_contract_draft::{handle_create_contract_draft, CreateContractDraftCmd},
             create_work::{handle_create_work, CreateWorkCmd},
             resume_session::{handle_resume_session, ResumeSessionCmd},
+            test_support::{
+                load_runtime_assets, runtime_intent_output, sample_usage, RuntimeIntentOutput,
+            },
         },
         model::{
             workspace_fingerprint, ActorKind, AgentId, CompanyId, ContractSet, ContractSetId,
@@ -781,17 +779,19 @@ mod tests {
         agent_id: &AgentId,
         expected_rev: u64,
     ) -> CoclaiRuntime {
-        let assets = RuntimeAssets::load_from_repo_root(Path::new(env!("CARGO_MANIFEST_DIR")))
-            .expect("assets should load");
+        let assets = load_runtime_assets();
         let runtime_lease_id = LeaseId::from("33333333-3333-4333-8333-333333333333");
         let intent = runtime_intent(work_id, agent_id, &runtime_lease_id, expected_rev);
-        let raw_output = format!(
-            "{{\"work_id\":\"{}\",\"agent_id\":\"{}\",\"lease_id\":\"{}\",\"expected_rev\":{},\"kind\":\"propose_progress\",\"patch\":{{\"summary\":\"runtime progress\",\"resolved_obligations\":[],\"declared_risks\":[]}},\"note\":null,\"proof_hints\":[{{\"kind\":\"summary\",\"value\":\"runtime progress\"}}]}}",
-            work_id,
-            agent_id,
-            runtime_lease_id,
-            expected_rev
-        );
+        let raw_output = runtime_intent_output(RuntimeIntentOutput {
+            work_id: work_id.as_str(),
+            agent_id: agent_id.as_str(),
+            lease_id: runtime_lease_id.as_str(),
+            expected_rev,
+            kind: "propose_progress",
+            summary: "runtime progress",
+            note: None,
+            proof_hints: &[("summary", "runtime progress")],
+        });
 
         CoclaiRuntime::with_scripted_replies(
             assets,
@@ -801,12 +801,7 @@ mod tests {
                 },
                 raw_output,
                 intent,
-                usage: crate::model::ConsumptionUsage {
-                    input_tokens: 120,
-                    output_tokens: 48,
-                    run_seconds: 3,
-                    estimated_cost_cents: Some(7),
-                },
+                usage: sample_usage(120, 48, 3, 7),
                 invalid_session: false,
             }],
         )

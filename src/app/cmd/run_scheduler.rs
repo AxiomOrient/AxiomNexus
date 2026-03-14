@@ -60,15 +60,13 @@ pub(crate) fn next_queued_run_id(candidates: &[QueuedRunCandidate]) -> Option<cr
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use crate::{
         adapter::{
-            coclai::{
-                assets::RuntimeAssets,
-                runtime::{CoclaiRuntime, ScriptedReply},
-            },
+            coclai::runtime::{CoclaiRuntime, ScriptedReply},
             memory::store::{MemoryStore, DEMO_AGENT_ID, DEMO_DOING_WORK_ID, DEMO_TODO_WORK_ID},
+        },
+        app::cmd::test_support::{
+            load_runtime_assets, runtime_intent_output, sample_usage, RuntimeIntentOutput,
         },
         model::{
             ActorId, ActorKind, AgentId, AgentStatus, BillingKind, CompanyId, ConsumptionUsage,
@@ -90,8 +88,7 @@ mod tests {
 
     #[test]
     fn run_scheduler_consumes_oldest_queued_run_and_saves_session() {
-        let assets = RuntimeAssets::load_from_repo_root(Path::new(env!("CARGO_MANIFEST_DIR")))
-            .expect("assets should load");
+        let assets = load_runtime_assets();
         let runtime = CoclaiRuntime::with_scripted_replies(
             assets,
             vec![ScriptedReply {
@@ -105,7 +102,7 @@ mod tests {
                     "scheduler turn",
                 ),
                 intent: intent(),
-                usage: usage(),
+                usage: sample_usage(90, 32, 2, 5),
                 invalid_session: false,
             }],
         );
@@ -145,8 +142,7 @@ mod tests {
 
     #[test]
     fn run_scheduler_is_idle_when_no_queued_run_exists() {
-        let assets = RuntimeAssets::load_from_repo_root(Path::new(env!("CARGO_MANIFEST_DIR")))
-            .expect("assets should load");
+        let assets = load_runtime_assets();
         let runtime = CoclaiRuntime::with_scripted_replies(assets, Vec::new());
         let store = MemoryStore::demo();
 
@@ -165,8 +161,7 @@ mod tests {
 
     #[test]
     fn run_scheduler_skips_budget_blocked_queue_before_runtime_start() {
-        let assets = RuntimeAssets::load_from_repo_root(Path::new(env!("CARGO_MANIFEST_DIR")))
-            .expect("assets should load");
+        let assets = load_runtime_assets();
         let runtime = CoclaiRuntime::with_scripted_replies(assets, Vec::new());
         let store = MemoryStore::demo();
         let company = store
@@ -267,8 +262,7 @@ mod tests {
 
     #[test]
     fn run_scheduler_reaps_stale_running_run_then_consumes_follow_up_queue() {
-        let assets = RuntimeAssets::load_from_repo_root(Path::new(env!("CARGO_MANIFEST_DIR")))
-            .expect("assets should load");
+        let assets = load_runtime_assets();
         let runtime = CoclaiRuntime::with_scripted_replies(
             assets,
             vec![ScriptedReply {
@@ -282,7 +276,7 @@ mod tests {
                     "reaped scheduler turn",
                 ),
                 intent: doing_work_intent(),
-                usage: usage(),
+                usage: sample_usage(90, 32, 2, 5),
                 invalid_session: false,
             }],
         );
@@ -349,8 +343,7 @@ mod tests {
 
     #[test]
     fn run_scheduler_prefers_existing_oldest_queue_over_new_reaper_follow_up() {
-        let assets = RuntimeAssets::load_from_repo_root(Path::new(env!("CARGO_MANIFEST_DIR")))
-            .expect("assets should load");
+        let assets = load_runtime_assets();
         let runtime = CoclaiRuntime::with_scripted_replies(
             assets,
             vec![ScriptedReply {
@@ -364,7 +357,7 @@ mod tests {
                     "scheduler turn",
                 ),
                 intent: intent(),
-                usage: usage(),
+                usage: sample_usage(90, 32, 2, 5),
                 invalid_session: false,
             }],
         );
@@ -477,22 +470,15 @@ mod tests {
     }
 
     fn valid_output(work_id: &str, lease_id: &str, expected_rev: u64, summary: &str) -> String {
-        format!(
-            "{{\"work_id\":\"{work_id}\",\"agent_id\":\"{agent_id}\",\"lease_id\":\"{lease_id}\",\"expected_rev\":{expected_rev},\"kind\":\"propose_progress\",\"patch\":{{\"summary\":\"{summary}\",\"resolved_obligations\":[],\"declared_risks\":[]}},\"note\":null,\"proof_hints\":[{{\"kind\":\"summary\",\"value\":\"{summary}\"}}]}}",
-            work_id = work_id,
-            agent_id = DEMO_AGENT_ID,
-            lease_id = lease_id,
-            expected_rev = expected_rev,
-            summary = summary,
-        )
-    }
-
-    fn usage() -> ConsumptionUsage {
-        ConsumptionUsage {
-            input_tokens: 90,
-            output_tokens: 32,
-            run_seconds: 2,
-            estimated_cost_cents: Some(5),
-        }
+        runtime_intent_output(RuntimeIntentOutput {
+            work_id,
+            agent_id: DEMO_AGENT_ID,
+            lease_id,
+            expected_rev,
+            kind: "propose_progress",
+            summary,
+            note: None,
+            proof_hints: &[("summary", summary)],
+        })
     }
 }

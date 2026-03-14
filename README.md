@@ -106,8 +106,6 @@ scripts/verify-runtime.sh
 - [청사진](docs/02-BLUEPRINT.md) — 구조와 제어 흐름
 - [도메인 모델과 불변식](docs/03-DOMAIN-AND-INVARIANTS.md) — 핵심 모델 기준
 - [저장소 계약](docs/spec/STOREPORT-SEMANTIC-CONTRACT.md) — store 의미론 기준
-- [실행 계획](plans/IMPLEMENTATION-PLAN.md) — 현재 미션 계획
-- [태스크 ledger](plans/TASKS.md) — 현재 미션 검증 기록
 
 ## 현재 제한
 

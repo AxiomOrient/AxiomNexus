@@ -160,21 +160,20 @@ pub(crate) fn select_runnable_run_id(candidates: &[QueuedRunCandidate]) -> Optio
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use crate::{
         adapter::{
-            coclai::{
-                assets::RuntimeAssets,
-                runtime::{CoclaiRuntime, ScriptedReply},
-            },
+            coclai::runtime::{CoclaiRuntime, ScriptedReply},
             memory::store::{MemoryStore, DEMO_AGENT_ID, DEMO_DOING_WORK_ID, DEMO_TODO_WORK_ID},
         },
-        app::cmd::RUNTIME_RESUME_POLICY,
+        app::cmd::{
+            test_support::{
+                load_runtime_assets, runtime_intent_output, sample_usage, RuntimeIntentOutput,
+            },
+            RUNTIME_RESUME_POLICY,
+        },
         model::{
-            workspace_fingerprint, AgentStatus, ConsumptionUsage, DecisionOutcome, LeaseId,
-            RuntimeKind, SessionId, TaskSession, TransitionIntent, TransitionKind, WorkId,
-            WorkPatch,
+            workspace_fingerprint, AgentStatus, DecisionOutcome, LeaseId, RuntimeKind, SessionId,
+            TaskSession, TransitionIntent, TransitionKind, WorkId, WorkPatch,
         },
         port::{
             runtime::RuntimeHandle,
@@ -186,8 +185,7 @@ mod tests {
 
     #[test]
     fn run_turn_once_response_exposes_work_run_agent_session_and_wake_outcome() {
-        let assets = RuntimeAssets::load_from_repo_root(Path::new(env!("CARGO_MANIFEST_DIR")))
-            .expect("assets should load");
+        let assets = load_runtime_assets();
         let runtime = CoclaiRuntime::with_scripted_replies(
             assets,
             vec![ScriptedReply {
@@ -196,7 +194,7 @@ mod tests {
                 },
                 raw_output: valid_queued_output(),
                 intent: queued_intent(),
-                usage: usage(),
+                usage: sample_usage(120, 48, 3, 7),
                 invalid_session: false,
             }],
         );
@@ -248,8 +246,7 @@ mod tests {
 
     #[test]
     fn run_turn_once_reports_existing_doing_work_context() {
-        let assets = RuntimeAssets::load_from_repo_root(Path::new(env!("CARGO_MANIFEST_DIR")))
-            .expect("assets should load");
+        let assets = load_runtime_assets();
         let runtime = CoclaiRuntime::with_scripted_replies(
             assets,
             vec![ScriptedReply {
@@ -258,7 +255,7 @@ mod tests {
                 },
                 raw_output: valid_doing_output(),
                 intent: doing_intent(),
-                usage: usage(),
+                usage: sample_usage(120, 48, 3, 7),
                 invalid_session: false,
             }],
         );
@@ -281,8 +278,7 @@ mod tests {
 
     #[test]
     fn run_turn_once_commits_runtime_observations_without_workspace_port() {
-        let assets = RuntimeAssets::load_from_repo_root(Path::new(env!("CARGO_MANIFEST_DIR")))
-            .expect("assets should load");
+        let assets = load_runtime_assets();
         let runtime = CoclaiRuntime::with_scripted_replies(
             assets,
             vec![ScriptedReply {
@@ -291,7 +287,7 @@ mod tests {
                 },
                 raw_output: valid_queued_output(),
                 intent: queued_intent(),
-                usage: usage(),
+                usage: sample_usage(120, 48, 3, 7),
                 invalid_session: false,
             }],
         );
@@ -322,8 +318,7 @@ mod tests {
 
     #[test]
     fn run_turn_once_reports_standard_stage_evidence_counts_for_complete_intent() {
-        let assets = RuntimeAssets::load_from_repo_root(Path::new(env!("CARGO_MANIFEST_DIR")))
-            .expect("assets should load");
+        let assets = load_runtime_assets();
         let runtime = CoclaiRuntime::with_scripted_replies(
             assets,
             vec![ScriptedReply {
@@ -332,7 +327,7 @@ mod tests {
                 },
                 raw_output: valid_complete_output(),
                 intent: complete_intent(),
-                usage: usage(),
+                usage: sample_usage(120, 48, 3, 7),
                 invalid_session: false,
             }],
         );
@@ -356,8 +351,7 @@ mod tests {
 
     #[test]
     fn run_turn_once_commits_runtime_intent_into_snapshot_and_transition_record() {
-        let assets = RuntimeAssets::load_from_repo_root(Path::new(env!("CARGO_MANIFEST_DIR")))
-            .expect("assets should load");
+        let assets = load_runtime_assets();
         let runtime = CoclaiRuntime::with_scripted_replies(
             assets,
             vec![ScriptedReply {
@@ -366,7 +360,7 @@ mod tests {
                 },
                 raw_output: valid_complete_output(),
                 intent: complete_intent(),
-                usage: usage(),
+                usage: sample_usage(120, 48, 3, 7),
                 invalid_session: false,
             }],
         );
@@ -443,8 +437,7 @@ mod tests {
 
     #[test]
     fn run_turn_once_rejected_decision_marks_run_failed_after_record_append() {
-        let assets = RuntimeAssets::load_from_repo_root(Path::new(env!("CARGO_MANIFEST_DIR")))
-            .expect("assets should load");
+        let assets = load_runtime_assets();
         let runtime = CoclaiRuntime::with_scripted_replies(
             assets,
             vec![ScriptedReply {
@@ -453,7 +446,7 @@ mod tests {
                 },
                 raw_output: rejected_complete_output(),
                 intent: rejected_complete_intent(),
-                usage: usage(),
+                usage: sample_usage(120, 48, 3, 7),
                 invalid_session: false,
             }],
         );
@@ -491,8 +484,7 @@ mod tests {
 
     #[test]
     fn run_turn_once_conflict_write_marks_run_failed() {
-        let assets = RuntimeAssets::load_from_repo_root(Path::new(env!("CARGO_MANIFEST_DIR")))
-            .expect("assets should load");
+        let assets = load_runtime_assets();
         let runtime = CoclaiRuntime::with_scripted_replies(
             assets,
             vec![ScriptedReply {
@@ -501,7 +493,7 @@ mod tests {
                 },
                 raw_output: valid_stale_doing_output(),
                 intent: stale_doing_intent(),
-                usage: usage(),
+                usage: sample_usage(120, 48, 3, 7),
                 invalid_session: false,
             }],
         );
@@ -535,8 +527,7 @@ mod tests {
 
     #[test]
     fn run_turn_once_prefers_existing_matching_session() {
-        let assets = RuntimeAssets::load_from_repo_root(Path::new(env!("CARGO_MANIFEST_DIR")))
-            .expect("assets should load");
+        let assets = load_runtime_assets();
         let runtime = CoclaiRuntime::with_scripted_replies(
             assets,
             vec![ScriptedReply {
@@ -545,7 +536,7 @@ mod tests {
                 },
                 raw_output: valid_doing_output(),
                 intent: doing_intent(),
-                usage: usage(),
+                usage: sample_usage(120, 48, 3, 7),
                 invalid_session: false,
             }],
         );
@@ -586,8 +577,7 @@ mod tests {
 
     #[test]
     fn run_turn_once_reports_invalid_session_single_retry() {
-        let assets = RuntimeAssets::load_from_repo_root(Path::new(env!("CARGO_MANIFEST_DIR")))
-            .expect("assets should load");
+        let assets = load_runtime_assets();
         let runtime = CoclaiRuntime::with_scripted_replies(
             assets,
             vec![
@@ -597,7 +587,7 @@ mod tests {
                     },
                     raw_output: valid_doing_output(),
                     intent: doing_intent(),
-                    usage: usage(),
+                    usage: sample_usage(120, 48, 3, 7),
                     invalid_session: true,
                 },
                 ScriptedReply {
@@ -606,7 +596,7 @@ mod tests {
                     },
                     raw_output: valid_doing_output(),
                     intent: doing_intent(),
-                    usage: usage(),
+                    usage: sample_usage(120, 48, 3, 7),
                     invalid_session: false,
                 },
             ],
@@ -651,8 +641,7 @@ mod tests {
 
     #[test]
     fn run_turn_once_invalid_output_does_not_mutate_snapshot_or_append_transition_record() {
-        let assets = RuntimeAssets::load_from_repo_root(Path::new(env!("CARGO_MANIFEST_DIR")))
-            .expect("assets should load");
+        let assets = load_runtime_assets();
         let runtime = CoclaiRuntime::with_scripted_replies(
             assets,
             vec![
@@ -662,7 +651,7 @@ mod tests {
                     },
                     raw_output: "{\"kind\":\"complete\"}".to_owned(),
                     intent: doing_intent(),
-                    usage: usage(),
+                    usage: sample_usage(120, 48, 3, 7),
                     invalid_session: false,
                 },
                 ScriptedReply {
@@ -671,7 +660,7 @@ mod tests {
                     },
                     raw_output: "{\"kind\":\"complete\"}".to_owned(),
                     intent: doing_intent(),
-                    usage: usage(),
+                    usage: sample_usage(120, 48, 3, 7),
                     invalid_session: false,
                 },
             ],
@@ -864,101 +853,67 @@ mod tests {
     }
 
     fn valid_queued_output() -> String {
-        serde_json::json!({
-            "work_id": DEMO_TODO_WORK_ID,
-            "agent_id": DEMO_AGENT_ID,
-            "lease_id": runtime_lease_id(&crate::model::RunId::from("run-2")).as_str(),
-            "expected_rev": 1,
-            "kind": "propose_progress",
-            "patch": {
-                "summary": "scheduler turn",
-                "resolved_obligations": [],
-                "declared_risks": []
-            },
-            "note": null,
-            "proof_hints": [{"kind":"summary","value":"scheduler turn"}]
+        runtime_intent_output(RuntimeIntentOutput {
+            work_id: DEMO_TODO_WORK_ID,
+            agent_id: DEMO_AGENT_ID,
+            lease_id: runtime_lease_id(&crate::model::RunId::from("run-2")).as_str(),
+            expected_rev: 1,
+            kind: "propose_progress",
+            summary: "scheduler turn",
+            note: None,
+            proof_hints: &[("summary", "scheduler turn")],
         })
-        .to_string()
     }
 
     fn valid_doing_output() -> String {
-        serde_json::json!({
-            "work_id": DEMO_DOING_WORK_ID,
-            "agent_id": DEMO_AGENT_ID,
-            "lease_id": "00000000-0000-4000-8000-000000000013",
-            "expected_rev": 1,
-            "kind": "propose_progress",
-            "patch": {
-                "summary": "doing turn",
-                "resolved_obligations": [],
-                "declared_risks": []
-            },
-            "note": null,
-            "proof_hints": []
+        runtime_intent_output(RuntimeIntentOutput {
+            work_id: DEMO_DOING_WORK_ID,
+            agent_id: DEMO_AGENT_ID,
+            lease_id: "00000000-0000-4000-8000-000000000013",
+            expected_rev: 1,
+            kind: "propose_progress",
+            summary: "doing turn",
+            note: None,
+            proof_hints: &[],
         })
-        .to_string()
     }
 
     fn valid_complete_output() -> String {
-        serde_json::json!({
-            "work_id": DEMO_DOING_WORK_ID,
-            "agent_id": DEMO_AGENT_ID,
-            "lease_id": "00000000-0000-4000-8000-000000000013",
-            "expected_rev": 1,
-            "kind": "complete",
-            "patch": {
-                "summary": "complete with evidence",
-                "resolved_obligations": [],
-                "declared_risks": []
-            },
-            "note": "done",
-            "proof_hints": [{"kind":"file","value":"src/kernel/mod.rs"}]
+        runtime_intent_output(RuntimeIntentOutput {
+            work_id: DEMO_DOING_WORK_ID,
+            agent_id: DEMO_AGENT_ID,
+            lease_id: "00000000-0000-4000-8000-000000000013",
+            expected_rev: 1,
+            kind: "complete",
+            summary: "complete with evidence",
+            note: Some("done"),
+            proof_hints: &[("file", "src/kernel/mod.rs")],
         })
-        .to_string()
     }
 
     fn rejected_complete_output() -> String {
-        serde_json::json!({
-            "work_id": DEMO_DOING_WORK_ID,
-            "agent_id": DEMO_AGENT_ID,
-            "lease_id": "00000000-0000-4000-8000-000000000013",
-            "expected_rev": 1,
-            "kind": "complete",
-            "patch": {
-                "summary": "complete without file evidence",
-                "resolved_obligations": [],
-                "declared_risks": []
-            },
-            "note": "done",
-            "proof_hints": [{"kind":"summary","value":"complete without file evidence"}]
+        runtime_intent_output(RuntimeIntentOutput {
+            work_id: DEMO_DOING_WORK_ID,
+            agent_id: DEMO_AGENT_ID,
+            lease_id: "00000000-0000-4000-8000-000000000013",
+            expected_rev: 1,
+            kind: "complete",
+            summary: "complete without file evidence",
+            note: Some("done"),
+            proof_hints: &[("summary", "complete without file evidence")],
         })
-        .to_string()
     }
 
     fn valid_stale_doing_output() -> String {
-        serde_json::json!({
-            "work_id": DEMO_DOING_WORK_ID,
-            "agent_id": DEMO_AGENT_ID,
-            "lease_id": "00000000-0000-4000-8000-000000000013",
-            "expected_rev": 0,
-            "kind": "propose_progress",
-            "patch": {
-                "summary": "stale doing turn",
-                "resolved_obligations": [],
-                "declared_risks": []
-            },
-            "note": null,
-            "proof_hints": [{"kind":"summary","value":"stale doing turn"}]
+        runtime_intent_output(RuntimeIntentOutput {
+            work_id: DEMO_DOING_WORK_ID,
+            agent_id: DEMO_AGENT_ID,
+            lease_id: "00000000-0000-4000-8000-000000000013",
+            expected_rev: 0,
+            kind: "propose_progress",
+            summary: "stale doing turn",
+            note: None,
+            proof_hints: &[("summary", "stale doing turn")],
         })
-        .to_string()
-    }
-
-    fn usage() -> ConsumptionUsage {
-        ConsumptionUsage {
-            input_tokens: 120,
-            output_tokens: 48,
-            run_seconds: 3,
-            estimated_cost_cents: Some(7),
-        }
     }
 }

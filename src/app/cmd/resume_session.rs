@@ -195,20 +195,20 @@ fn runtime_error_to_store_error(error: crate::port::runtime::RuntimeError) -> St
 
 #[cfg(test)]
 mod tests {
-    use std::{path::Path, time::SystemTime};
+    use std::time::SystemTime;
 
     use crate::{
         adapter::{
-            coclai::{
-                assets::RuntimeAssets,
-                runtime::{CoclaiRuntime, ScriptedReply},
-            },
+            coclai::runtime::{CoclaiRuntime, ScriptedReply},
             memory::store::{MemoryStore, DEMO_AGENT_ID, DEMO_DOING_WORK_ID},
         },
+        app::cmd::test_support::{
+            load_runtime_assets, runtime_intent_output, sample_usage, RuntimeIntentOutput,
+        },
         model::{
-            workspace_fingerprint, AgentId, CompanyId, ConsumptionUsage, LeaseId, RunId,
-            RuntimeKind, SessionId, SessionInvalidationReason, TaskSession, TransitionIntent,
-            TransitionKind, WorkId, WorkPatch,
+            workspace_fingerprint, AgentId, CompanyId, LeaseId, RunId, RuntimeKind, SessionId,
+            SessionInvalidationReason, TaskSession, TransitionIntent, TransitionKind, WorkId,
+            WorkPatch,
         },
         port::{
             runtime::RuntimeHandle,
@@ -220,8 +220,7 @@ mod tests {
 
     #[test]
     fn resume_session_starts_for_queued_run_and_saves_session() {
-        let assets = RuntimeAssets::load_from_repo_root(Path::new(env!("CARGO_MANIFEST_DIR")))
-            .expect("assets should load");
+        let assets = load_runtime_assets();
         let runtime = CoclaiRuntime::with_scripted_replies(
             assets,
             vec![ScriptedReply {
@@ -230,7 +229,7 @@ mod tests {
                 },
                 raw_output: valid_output("propose_progress"),
                 intent: intent(TransitionKind::ProposeProgress),
-                usage: usage(),
+                usage: sample_usage(120, 48, 3, 7),
                 invalid_session: false,
             }],
         );
@@ -296,8 +295,7 @@ mod tests {
 
     #[test]
     fn resume_session_prefers_existing_matching_session() {
-        let assets = RuntimeAssets::load_from_repo_root(Path::new(env!("CARGO_MANIFEST_DIR")))
-            .expect("assets should load");
+        let assets = load_runtime_assets();
         let runtime = CoclaiRuntime::with_scripted_replies(
             assets,
             vec![ScriptedReply {
@@ -306,7 +304,7 @@ mod tests {
                 },
                 raw_output: valid_output("complete"),
                 intent: intent(TransitionKind::Complete),
-                usage: usage(),
+                usage: sample_usage(120, 48, 3, 7),
                 invalid_session: false,
             }],
         );
@@ -346,8 +344,7 @@ mod tests {
 
     #[test]
     fn resume_session_resets_when_workspace_changes() {
-        let assets = RuntimeAssets::load_from_repo_root(Path::new(env!("CARGO_MANIFEST_DIR")))
-            .expect("assets should load");
+        let assets = load_runtime_assets();
         let runtime = CoclaiRuntime::with_scripted_replies(
             assets,
             vec![ScriptedReply {
@@ -356,7 +353,7 @@ mod tests {
                 },
                 raw_output: valid_output("complete"),
                 intent: intent(TransitionKind::Complete),
-                usage: usage(),
+                usage: sample_usage(120, 48, 3, 7),
                 invalid_session: false,
             }],
         );
@@ -408,8 +405,7 @@ mod tests {
 
     #[test]
     fn resume_session_marks_run_failed_with_runtime_failure_activity() {
-        let assets = RuntimeAssets::load_from_repo_root(Path::new(env!("CARGO_MANIFEST_DIR")))
-            .expect("assets should load");
+        let assets = load_runtime_assets();
         let runtime = CoclaiRuntime::with_scripted_replies(
             assets,
             vec![
@@ -419,7 +415,7 @@ mod tests {
                     },
                     raw_output: "{\"kind\":\"complete\"}".to_owned(),
                     intent: intent(TransitionKind::Complete),
-                    usage: usage(),
+                    usage: sample_usage(120, 48, 3, 7),
                     invalid_session: false,
                 },
                 ScriptedReply {
@@ -428,7 +424,7 @@ mod tests {
                     },
                     raw_output: "{\"kind\":\"complete\"}".to_owned(),
                     intent: intent(TransitionKind::Complete),
-                    usage: usage(),
+                    usage: sample_usage(120, 48, 3, 7),
                     invalid_session: false,
                 },
             ],
@@ -493,21 +489,15 @@ mod tests {
     }
 
     fn valid_output(kind: &str) -> String {
-        format!(
-            "{{\"work_id\":\"{work_id}\",\"agent_id\":\"{agent_id}\",\"lease_id\":\"{lease_id}\",\"expected_rev\":1,\"kind\":\"{kind}\",\"patch\":{{\"summary\":\"runtime turn\",\"resolved_obligations\":[],\"declared_risks\":[]}},\"note\":null,\"proof_hints\":[]}}",
-            work_id = DEMO_DOING_WORK_ID,
-            agent_id = DEMO_AGENT_ID,
-            lease_id = "00000000-0000-4000-8000-000000000013",
-            kind = kind
-        )
-    }
-
-    fn usage() -> ConsumptionUsage {
-        ConsumptionUsage {
-            input_tokens: 120,
-            output_tokens: 48,
-            run_seconds: 3,
-            estimated_cost_cents: Some(7),
-        }
+        runtime_intent_output(RuntimeIntentOutput {
+            work_id: DEMO_DOING_WORK_ID,
+            agent_id: DEMO_AGENT_ID,
+            lease_id: "00000000-0000-4000-8000-000000000013",
+            expected_rev: 1,
+            kind,
+            summary: "runtime turn",
+            note: None,
+            proof_hints: &[],
+        })
     }
 }

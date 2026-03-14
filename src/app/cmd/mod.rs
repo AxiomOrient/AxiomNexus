@@ -24,5 +24,7 @@ pub(crate) mod run_scheduler;
 pub(crate) mod run_turn_once;
 pub(crate) mod set_agent_status;
 pub(crate) mod submit_intent;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub(crate) mod update_work;
 pub(crate) mod wake_work;

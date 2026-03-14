@@ -12,15 +12,13 @@
 6. `05-QUALITY-GATES.md` — 품질 게이트와 검증 전략
 7. `spec/STOREPORT-SEMANTIC-CONTRACT.md` — 저장소 의미론 기준 계약
 8. `spec/RUNTIMEPORT-EXECUTE-TURN-SPEC.md` — runtime turn 최종 계약
-9. `../plans/IMPLEMENTATION-PLAN.md` — 현재 미션 실행 계획
-10. `../plans/TASKS.md` — 실행 ledger
 
 정리 원칙:
 
 - `docs/`가 공식 읽기 표면이다.
 - `docs/spec/`는 바뀌면 안 되는 계약 문서다.
 - `docs/adr/`는 구조 결정을 기록한다.
-- `README.md`, `docs/`, `plans/`, `samples/`가 같은 canonical 구조를 말해야 한다.
+- `README.md`, `docs/`, `samples/`가 같은 canonical 구조를 말해야 한다.
 
 현재 상태를 설명하는 참고 문서:
 

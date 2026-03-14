@@ -187,6 +187,63 @@ mod tests {
         assert!(schema.contains("\"observations\""));
     }
 
+    #[test]
+    fn cargo_manifest_stays_single_root_package() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let manifest =
+            fs::read_to_string(repo_root.join("Cargo.toml")).expect("cargo manifest should load");
+
+        assert!(manifest.contains("name = \"axiomnexus\""));
+        assert!(manifest.contains("[package]"));
+        assert!(!manifest.contains("[workspace]"));
+        assert!(!manifest.contains("crates/axiomsync"));
+    }
+
+    #[test]
+    fn workspace_port_boundary_stays_removed_from_runtime_path() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+
+        assert!(
+            !repo_root.join("src/port/workspace.rs").exists(),
+            "workspace port file should stay removed",
+        );
+
+        let port_mod =
+            fs::read_to_string(repo_root.join("src/port/mod.rs")).expect("port module should load");
+        assert!(
+            !port_mod.contains("workspace"),
+            "port module should not re-export workspace boundary",
+        );
+
+        let run_turn_once = fs::read_to_string(repo_root.join("src/app/cmd/run_turn_once.rs"))
+            .expect("run_turn_once should load");
+        assert!(
+            !run_turn_once.contains("WorkspacePort"),
+            "run_turn_once should depend on runtime observations instead of WorkspacePort",
+        );
+
+        let guarded_dirs = [repo_root.join("src/app"), repo_root.join("src/port")];
+        for dir in guarded_dirs {
+            for path in rust_files_under(&dir) {
+                let display_path = path
+                    .strip_prefix(repo_root)
+                    .expect("source path should stay under repo root");
+                let text = fs::read_to_string(&path).expect("source file should load");
+                for token in [
+                    "workspace::WorkspacePort",
+                    "port::workspace",
+                    "mod workspace",
+                ] {
+                    assert!(
+                        !text.contains(token),
+                        "{} should not contain removed workspace token {token}",
+                        display_path.display()
+                    );
+                }
+            }
+        }
+    }
+
     fn rust_files_under(dir: &Path) -> Vec<PathBuf> {
         let mut files = Vec::new();
         let entries = fs::read_dir(dir).expect("source dir should exist");
