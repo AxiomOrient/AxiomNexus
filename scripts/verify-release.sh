@@ -4,6 +4,11 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+if [[ -n "${AXIOMNEXUS_RELEASE_EVIDENCE_DIR:-}" ]]; then
+  mkdir -p "$AXIOMNEXUS_RELEASE_EVIDENCE_DIR"
+  export AXIOMNEXUS_SMOKE_LOG_PATH="${AXIOMNEXUS_RELEASE_EVIDENCE_DIR%/}/smoke-runtime.log"
+fi
+
 echo "[1/4] scripts/verify-runtime.sh"
 scripts/verify-runtime.sh
 

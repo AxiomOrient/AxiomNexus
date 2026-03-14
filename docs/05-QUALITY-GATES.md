@@ -139,7 +139,7 @@ CLI + HTTP + runtime adapter가 함께 동작하는지 확인한다.
 ## ship-now 완료 조건
 
 1. `scripts/verify-release.sh`가 통과한다.
-2. runtime smoke가 queue → wake → `run once <run_id>` → accepted complete → replay까지 돈다.
+2. runtime smoke가 queue → wake → diagnostic `run once <run_id>` → accepted complete → replay까지 돈다.
 3. schema gate test가 `TransitionIntent`, `ExecuteTurnOutput` 둘 다 통과한다.
 4. replay mismatch가 0이어야 한다.
 5. 운영 기본값에서 scripted runtime 우회가 닫혀 있어야 한다.
@@ -147,5 +147,6 @@ CLI + HTTP + runtime adapter가 함께 동작하는지 확인한다.
 ## stable 추가 조건
 
 1. adapter conformance suite가 Surreal과 PostgreSQL 모두에서 통과한다.
-2. hot path benchmark baseline이 저장된다.
-3. observability audit가 끝난다.
+2. dual-store pass criteria가 `docs/spec/CONFORMANCE-SUITE.md`와 `plans/STABLE-BACKLOG.md`에 고정된다.
+3. hot path benchmark baseline artifact가 저장된다.
+4. observability audit가 끝나고 required span/event catalog가 문서화된다.

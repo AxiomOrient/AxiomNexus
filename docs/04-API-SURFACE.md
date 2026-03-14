@@ -9,7 +9,8 @@
 
 ## CLI
 
-현재 canonical auto path는 HTTP execute endpoint가 아니라 CLI `scheduler once` / `run once <run_id>`다. [R1]
+현재 canonical operator path는 HTTP execute endpoint가 아니라 CLI `scheduler once`다. [R1]
+`run once <run_id>`는 특정 queued run을 직접 태우는 deterministic diagnostic path다.
 
 ### bootstrap / maintenance
 - `migrate`
@@ -20,8 +21,8 @@
 
 ### runtime / serving
 - `serve`
-- `scheduler once`
-- `run once <run_id>`
+- `scheduler once` *(canonical operator path)*
+- `run once <run_id>` *(diagnostic path)*
 - `replay`
 
 ### 이후에도 추가하지 않을 것
@@ -71,7 +72,7 @@
 - `POST /api/work/{id}/override`
 - `POST /api/work/{id}/intents`
 
-여기서 queued run을 실제로 소비하는 auto path는 `cargo run -- scheduler once`이고, 배포 검증용 직접 실행 경로는 `cargo run -- run once <run_id>`다.  
+여기서 queued run을 운영자가 소비시키는 canonical operator path는 `cargo run -- scheduler once`이고, 배포 검증이나 재현용 deterministic diagnostic path는 `cargo run -- run once <run_id>`다.  
 핵심 write authority는 결국 `/api/work/{id}/intents`와 `commit_decision` 흐름이다.  
 다른 command도 최종적으로는 동일한 decision path 또는 같은 store semantics로 수렴해야 한다. [R1][R2]
 

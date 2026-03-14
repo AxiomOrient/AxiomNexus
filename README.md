@@ -41,10 +41,15 @@ cargo run -- migrate        # 스키마 적용
 cargo run -- doctor         # DB 연결 및 상태 확인
 cargo run -- contract check # 활성 계약 검증
 cargo run -- serve          # HTTP 서버 시작 (기본: 127.0.0.1:3000)
-cargo run -- scheduler once # 가장 오래된 queued run 1회 실행
-cargo run -- run once run-2 # 특정 queued run 1회 실행
+cargo run -- scheduler once # 운영용 canonical queue consumer
+cargo run -- run once run-2 # 특정 queued run을 직접 태우는 diagnostic path
 scripts/verify-release.sh   # ship-now release gate
 ```
+
+빠른 시작에서 command 역할은 아래처럼 고정한다.
+
+- `scheduler once`: 운영자가 queued run을 하나 소비시키는 canonical operator path
+- `run once <run_id>`: 특정 queued run을 직접 재현하는 deterministic diagnostic path
 
 scripted smoke는 `scripts/smoke-runtime.sh` 내부에서만 아래 조합을 임시로 사용한다.
 
@@ -95,8 +100,8 @@ AXIOMNEXUS_HTTP_ADDR=127.0.0.1:3001 cargo run -- serve
 | `doctor` | DB 연결 및 환경 점검 |
 | `contract check` | live active contract와 company binding 유효성 검사 |
 | `serve` | HTTP 서버 시작 |
-| `scheduler once` | 가장 오래된 queued run 하나를 runtime으로 실행 |
-| `run once <run_id>` | 특정 queued run 하나를 runtime으로 실행 |
+| `scheduler once` | canonical operator path로 가장 오래된 queued run 하나를 소비 |
+| `run once <run_id>` | deterministic diagnostic path로 특정 queued run 하나를 직접 실행 |
 | `replay` | live store에서 decision path 재진입 검증 |
 | `export` | 현재 Surreal store snapshot을 JSON으로 저장 |
 | `import` | snapshot JSON을 현재 Surreal store로 복원 |

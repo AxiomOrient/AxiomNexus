@@ -100,4 +100,9 @@
 - typed error contract 동일
 - same schema validator 통과
 
+stable gate 기준:
+- Surreal과 PostgreSQL이 같은 fixture set를 공유한다.
+- 두 adapter 모두 같은 expected outcome과 replay result를 낸다.
+- failure class와 export/import roundtrip 결과가 같아야 한다.
+
 이 문서가 adapter portability의 최종 기준이다.
