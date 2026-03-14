@@ -1,5 +1,7 @@
 # OS / editor noise
 .DS_Store
+.DS_Store?
+**/.DS_Store
 Thumbs.db
 Desktop.ini
 .idea/

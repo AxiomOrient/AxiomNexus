@@ -7,17 +7,17 @@
 - [R1] AxiomNexus `README.md` (dev)  
   https://raw.githubusercontent.com/AxiomOrient/AxiomNexus/dev/README.md
 
-- [R2] AxiomNexus `docs/05-target-architecture.md` (dev)  
-  https://raw.githubusercontent.com/AxiomOrient/AxiomNexus/dev/docs/05-target-architecture.md
+- [R2] AxiomNexus `docs/02-BLUEPRINT.md` (dev)  
+  https://raw.githubusercontent.com/AxiomOrient/AxiomNexus/dev/docs/02-BLUEPRINT.md
 
-- [R3] AxiomNexus `docs/01-system-design.md` (dev)  
-  https://raw.githubusercontent.com/AxiomOrient/AxiomNexus/dev/docs/01-system-design.md
+- [R3] AxiomNexus `docs/03-DOMAIN-AND-INVARIANTS.md` (dev)  
+  https://raw.githubusercontent.com/AxiomOrient/AxiomNexus/dev/docs/03-DOMAIN-AND-INVARIANTS.md
 
 - [R4] AxiomNexus `src/port/runtime.rs` (dev)  
   https://github.com/AxiomOrient/AxiomNexus/blob/dev/src/port/runtime.rs
 
-- [R5] AxiomNexus `src/port/workspace.rs` (dev)  
-  https://github.com/AxiomOrient/AxiomNexus/blob/dev/src/port/workspace.rs
+- [R5] AxiomNexus `docs/adr/ADR-003-remove-workspaceport.md` (dev)  
+  https://raw.githubusercontent.com/AxiomOrient/AxiomNexus/dev/docs/adr/ADR-003-remove-workspaceport.md
 
 - [R6] AxiomNexus `src/port/store.rs` (dev)  
   https://github.com/AxiomOrient/AxiomNexus/blob/dev/src/port/store.rs
@@ -107,6 +107,7 @@
 ## 레퍼런스 사용 규칙
 
 1. `[R*]` 는 현재 AxiomNexus 저장소 상태를 설명할 때 사용한다.
+   역사 참고 문서보다 현재 canonical 문서를 우선한다.
 2. `[P1]`, `[T1]` 는 외부 레퍼런스 프로젝트에서 가져올 primitive를 설명할 때 사용한다.
 3. `[S*]`, `[PG*]` 는 저장소 전략과 adapter 전략의 근거로 사용한다.
 4. `[AX*]`, `[TP1]`, `[DP1]`, `[RF1]`, `[TR1]`, `[PT1]`, `[CR1]`, `[IN1]`, `[SC1]`, `[JS1]` 는 구현 도구 선택의 근거로 사용한다.

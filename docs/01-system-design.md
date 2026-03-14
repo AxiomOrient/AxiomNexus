@@ -1,5 +1,8 @@
 # 시스템 설계
 
+> 상태: 역사 참고용 문서.
+> 현재 기준 문서는 `docs/01-FINAL-TARGET.md`, `docs/02-BLUEPRINT.md`, `docs/03-DOMAIN-AND-INVARIANTS.md`다.
+
 ## 한 문장 정의
 
 AxiomNexus는 회사별 계약 아래에서만 work 상태 전이를 확정하는 IDC control plane입니다.

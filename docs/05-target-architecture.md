@@ -1,5 +1,8 @@
 # 목표 아키텍처
 
+> 상태: 역사 참고용 문서.
+> 현재 기준 문서는 `docs/01-FINAL-TARGET.md`, `docs/02-BLUEPRINT.md`, `docs/03-DOMAIN-AND-INVARIANTS.md`다.
+
 이 문서는 현재 구현을 기준으로 다시 정리한 AxiomNexus v1 목표 설계입니다.
 
 핵심 문장:

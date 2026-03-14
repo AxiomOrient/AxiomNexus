@@ -15,8 +15,7 @@ canonical reader path는 두 곳으로 고정한다.
 6. `05-QUALITY-GATES.md` — 품질 게이트와 검증 전략
 7. `spec/STOREPORT-SEMANTIC-CONTRACT.md` — 저장소 의미론 기준 계약
 8. `spec/RUNTIMEPORT-EXECUTE-TURN-SPEC.md` — runtime turn 최종 계약
-9. `../RELEASE-CHECKLIST.md` — ship-now release 절차
-10. `RELEASE-NOTES-TEMPLATE.md` — release note 기록 형식
+9. `RELEASE-NOTES-TEMPLATE.md` — release note 기록 형식
 
 정리 원칙:
 
@@ -24,9 +23,11 @@ canonical reader path는 두 곳으로 고정한다.
 - `docs/`는 제품/계약 문서 표면이다.
 - `docs/spec/`는 바뀌면 안 되는 계약 문서다.
 - `docs/adr/`는 구조 결정을 기록한다.
-- `README.md`, `docs/`, `samples/`, release docs가 같은 canonical 구조를 말해야 한다.
+- `README.md`, `docs/`, `samples/`는 같은 canonical 구조를 말해야 한다.
 
-현재 상태를 설명하는 참고 문서:
+역사 참고 문서:
 
-- `01-system-design.md` — 현재 제품 경계와 핵심 데이터 모델
-- `05-target-architecture.md` — 현재 저장소 기준 목표 구조 요약
+- `01-system-design.md` — 초기 제품 경계 요약. 현재 canonical entry는 아님
+- `05-target-architecture.md` — 초기 목표 구조 요약. 현재 canonical entry는 아님
+
+이 두 문서는 삭제 대상은 아니지만, 새 작업의 시작점으로 쓰지 않는다.
