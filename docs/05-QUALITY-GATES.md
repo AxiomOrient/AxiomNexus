@@ -83,6 +83,10 @@ pure function과 state rule을 검증한다.
 ### 5. end-to-end smoke tests
 CLI + HTTP + runtime adapter가 함께 동작하는지 확인한다.
 
+주의:
+- scripted runtime smoke는 `AXIOMNEXUS_ALLOW_SCRIPTED_RUNTIME=1`이 있을 때만 허용한다.
+- `AXIOMNEXUS_COCLAI_SCRIPT_PATH`만으로는 운영 runtime이 바뀌지 않아야 한다.
+
 ---
 
 ## later hardening 후보 도구
@@ -138,6 +142,7 @@ CLI + HTTP + runtime adapter가 함께 동작하는지 확인한다.
 2. runtime smoke가 queue → wake → `run once <run_id>` → accepted complete → replay까지 돈다.
 3. schema gate test가 `TransitionIntent`, `ExecuteTurnOutput` 둘 다 통과한다.
 4. replay mismatch가 0이어야 한다.
+5. 운영 기본값에서 scripted runtime 우회가 닫혀 있어야 한다.
 
 ## stable 추가 조건
 

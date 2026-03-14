@@ -34,6 +34,7 @@ TransitionIntent  →  kernel decides  →  store commits
 - 현재 live engine 기본값은 embedded SurrealKV입니다.
 - 새 환경 변수는 `AXIOMNEXUS_STORE_URL`입니다.
 - export 파일 경로는 `AXIOMNEXUS_EXPORT_PATH`이며 기본값은 `.axiomnexus/store_snapshot.json`입니다.
+- `AXIOMNEXUS_ALLOW_SCRIPTED_RUNTIME`는 smoke/test 전용입니다. 배포 환경에서는 설정하지 않습니다.
 
 ```bash
 cargo run -- migrate        # 스키마 적용
@@ -43,6 +44,13 @@ cargo run -- serve          # HTTP 서버 시작 (기본: 127.0.0.1:3000)
 cargo run -- scheduler once # 가장 오래된 queued run 1회 실행
 cargo run -- run once run-2 # 특정 queued run 1회 실행
 scripts/verify-release.sh   # ship-now release gate
+```
+
+scripted smoke는 `scripts/smoke-runtime.sh` 내부에서만 아래 조합을 임시로 사용한다.
+
+```bash
+AXIOMNEXUS_ALLOW_SCRIPTED_RUNTIME=1
+AXIOMNEXUS_COCLAI_SCRIPT_PATH=/tmp/scripted-replies.json
 ```
 
 다른 포트:
