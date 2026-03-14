@@ -52,7 +52,7 @@ AxiomNexus의 모델은 크게 둘이다.
 ### `PendingWake`
 재실행 필요 신호의 coalesced projection이다. [R2][R9]
 
-현재 저장소는 obligation을 deduped set으로 유지하고 count를 별도로 증가시키는 semantics를 이미 채택했다. [R9][R12]
+현재 저장소는 obligation을 deduped set으로 유지하고 count를 별도로 증가시키는 semantics를 이미 채택했다. [R9]
 
 즉:
 - queue fan-out 금지

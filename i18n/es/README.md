@@ -9,8 +9,6 @@ Empieza aqui:
 - [Objetivo final](../../docs/01-FINAL-TARGET.md)
 - [Plano](../../docs/02-BLUEPRINT.md)
 - [Modelo de dominio e invariantes](../../docs/03-DOMAIN-AND-INVARIANTS.md)
-- [Plan de implementacion](../../plans/IMPLEMENTATION-PLAN.md)
-- [Ledger de tareas](../../plans/TASKS.md)
 
 Inicio rapido:
 

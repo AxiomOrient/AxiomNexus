@@ -86,7 +86,7 @@ triad unsupported    -> missing support
 
 ## 6. 금지 규칙
 
-- AxiomNexus main crate가 triad crate를 직접 import하지 않는다. [R11]
+- AxiomNexus main crate가 triad crate를 직접 import하지 않는다. [R1]
 - triad가 AxiomNexus store를 직접 mutate하지 못한다.
 - triad config / CLI surface를 AxiomNexus가 재노출하지 않는다.
 - repo-local `.triad/*` bootstrap 자산을 canonical asset으로 만들지 않는다. [R1]

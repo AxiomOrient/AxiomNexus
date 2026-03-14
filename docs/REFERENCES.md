@@ -34,12 +34,6 @@
 - [R10] AxiomNexus `samples/transition-intent.schema.json` (dev)  
   https://raw.githubusercontent.com/AxiomOrient/AxiomNexus/dev/samples/transition-intent.schema.json
 
-- [R11] AxiomNexus `plans/IMPLEMENTATION-PLAN.md` (dev)  
-  https://raw.githubusercontent.com/AxiomOrient/AxiomNexus/dev/plans/IMPLEMENTATION-PLAN.md
-
-- [R12] AxiomNexus `plans/TASKS.md` (dev)  
-  https://raw.githubusercontent.com/AxiomOrient/AxiomNexus/dev/plans/TASKS.md
-
 ## 외부 레퍼런스 프로젝트
 
 - [P1] Paperclip GitHub README / repository page  

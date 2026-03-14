@@ -190,4 +190,4 @@ sequenceDiagram
 7. **PostgreSQL adapter later**
 
 이 순서가 가장 단순하다.  
-이 순서는 현재 저장소의 active docs와도 충돌하지 않는다. [R1][R2][R11][R12]
+이 순서는 현재 저장소의 active docs와도 충돌하지 않는다. [R1][R2]

@@ -146,7 +146,7 @@ read model용이다.
 - latest_reason은 마지막 reason으로 갱신
 - merged_at은 최신 시간으로 갱신
 
-현재 저장소와 동일 의미다. [R2][R9][R12]
+현재 저장소와 동일 의미다. [R2][R9]
 
 ---
 

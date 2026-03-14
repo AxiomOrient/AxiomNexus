@@ -26,7 +26,7 @@
 - adapter portability를 무엇으로 보장하는가
 - 지금 당장 무엇부터 구현해야 하는가
 
-이 패키지에서는 이를 `docs/`, `spec/`, `adr/`, `IMPLEMENTATION-PLAN.md`, `TASKS.md` 로 분리했다.
+이 패키지에서는 이를 `docs/`, `spec/`, `adr/` 로 분리했고, delivery-only 계획 문서는 ship surface에서 제외했다.
 
 ### 문제 C — StorePort 의미론이 부족했다
 Surreal과 PostgreSQL을 바꿔 끼우려면 CRUD 추상화가 아니라 **semantic contract**가 있어야 한다.  
