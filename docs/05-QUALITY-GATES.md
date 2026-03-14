@@ -6,17 +6,49 @@
 
 ---
 
-## 빌드 게이트
+## 게이트 계층
 
-현재 README가 선언한 기본 게이트는 유지한다. [R1]
+### 1. 개발 기본 게이트
+
+로컬 개발 중에는 아래만 먼저 본다.
+
+```bash
+scripts/verify-runtime.sh
+```
+
+이 스크립트는 아래 3개만 실행한다.
 
 ```bash
 cargo fmt --all --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
-scripts/smoke-runtime.sh
-scripts/verify-runtime.sh
 ```
+
+### 2. ship-now release gate
+
+출시 가능 여부는 아래 한 스크립트로 본다.
+
+```bash
+scripts/verify-release.sh
+```
+
+이 스크립트는 아래를 포함한다.
+
+```bash
+scripts/verify-runtime.sh
+cargo test transition_intent_schema_gate_is_live_contract
+cargo test execute_turn_output_schema_gate_is_live_contract
+scripts/smoke-runtime.sh
+```
+
+### 3. later hardening gate
+
+preview release를 막지 않고 stable 이전에 별도로 닫는다.
+
+- PostgreSQL adapter conformance
+- dual-store conformance suite
+- benchmark baseline
+- extended observability audit
 
 ---
 
@@ -53,7 +85,7 @@ CLI + HTTP + runtime adapter가 함께 동작하는지 확인한다.
 
 ---
 
-## 권장 도구
+## later hardening 후보 도구
 
 - `tracing` — structured event-based diagnostics [TR1]
 - `proptest` — property testing [PT1]
@@ -100,10 +132,15 @@ CLI + HTTP + runtime adapter가 함께 동작하는지 확인한다.
 
 ---
 
-## 품질 완료 조건
+## ship-now 완료 조건
 
-1. unit + integration + replay + smoke가 모두 통과한다.
-2. adapter conformance suite가 Surreal과 PostgreSQL 모두에서 통과한다.
-3. replay mismatch가 0이어야 한다.
-4. hot path benchmark baseline이 저장된다.
-5. schema drift test가 `TransitionIntent`, `ExecuteTurnOutput` 둘 다 통과한다.
+1. `scripts/verify-release.sh`가 통과한다.
+2. runtime smoke가 queue → wake → `run once <run_id>` → accepted complete → replay까지 돈다.
+3. schema gate test가 `TransitionIntent`, `ExecuteTurnOutput` 둘 다 통과한다.
+4. replay mismatch가 0이어야 한다.
+
+## stable 추가 조건
+
+1. adapter conformance suite가 Surreal과 PostgreSQL 모두에서 통과한다.
+2. hot path benchmark baseline이 저장된다.
+3. observability audit가 끝난다.

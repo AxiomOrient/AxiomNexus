@@ -20,6 +20,8 @@ pub(crate) struct RunSchedulerAck {
     pub(crate) queue_policy: &'static str,
     pub(crate) run_id: Option<String>,
     pub(crate) runtime_session_id: Option<String>,
+    pub(crate) repair_count: u8,
+    pub(crate) session_reset_reason: Option<crate::model::SessionInvalidationReason>,
 }
 
 pub(crate) fn handle_run_scheduler(
@@ -35,6 +37,8 @@ pub(crate) fn handle_run_scheduler(
             queue_policy: SCHEDULER_PICK_POLICY,
             run_id: None,
             runtime_session_id: None,
+            repair_count: 0,
+            session_reset_reason: None,
         });
     };
 
@@ -51,6 +55,8 @@ pub(crate) fn handle_run_scheduler(
         queue_policy: SCHEDULER_PICK_POLICY,
         run_id: Some(run_id.to_string()),
         runtime_session_id: Some(ack.runtime_session_id),
+        repair_count: ack.repair_count,
+        session_reset_reason: ack.session_reset_reason,
     })
 }
 
@@ -137,6 +143,8 @@ mod tests {
 
         assert_eq!(ack.run_id.as_deref(), Some("run-2"));
         assert_eq!(ack.runtime_session_id.as_deref(), Some("runtime-scheduler"));
+        assert_eq!(ack.repair_count, 0);
+        assert_eq!(ack.session_reset_reason, None);
         assert_eq!(session.runtime_session_id, "runtime-scheduler");
     }
 
@@ -157,6 +165,8 @@ mod tests {
 
         assert!(ack.run_id.is_none());
         assert!(ack.runtime_session_id.is_none());
+        assert_eq!(ack.repair_count, 0);
+        assert_eq!(ack.session_reset_reason, None);
     }
 
     #[test]
@@ -258,6 +268,8 @@ mod tests {
         assert!(blocked_run.budget_blocked);
         assert!(ack.run_id.is_none());
         assert!(ack.runtime_session_id.is_none());
+        assert_eq!(ack.repair_count, 0);
+        assert_eq!(ack.session_reset_reason, None);
     }
 
     #[test]
@@ -314,6 +326,8 @@ mod tests {
 
         assert_eq!(ack.run_id.as_deref(), Some("run-2"));
         assert_eq!(ack.runtime_session_id.as_deref(), Some("runtime-reaped"));
+        assert_eq!(ack.repair_count, 0);
+        assert_eq!(ack.session_reset_reason, None);
         assert_eq!(session.runtime_session_id, "runtime-reaped");
         assert_eq!(
             work.items[0].active_lease_id.as_deref(),
@@ -413,6 +427,8 @@ mod tests {
             ack.runtime_session_id.as_deref(),
             Some("runtime-oldest-queue")
         );
+        assert_eq!(ack.repair_count, 0);
+        assert_eq!(ack.session_reset_reason, None);
         assert_eq!(todo_session.runtime_session_id, "runtime-oldest-queue");
         assert_eq!(next_queued_run, Some(crate::model::RunId::from("run-3")));
         assert_eq!(doing_work.items[0].comments.len(), 2);

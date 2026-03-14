@@ -40,7 +40,9 @@ cargo run -- migrate        # 스키마 적용
 cargo run -- doctor         # DB 연결 및 상태 확인
 cargo run -- contract check # 활성 계약 검증
 cargo run -- serve          # HTTP 서버 시작 (기본: 127.0.0.1:3000)
-scripts/verify-runtime.sh   # fmt/clippy/test/smoke 전체 게이트
+cargo run -- scheduler once # 가장 오래된 queued run 1회 실행
+cargo run -- run once run-2 # 특정 queued run 1회 실행
+scripts/verify-release.sh   # ship-now release gate
 ```
 
 다른 포트:
@@ -85,6 +87,8 @@ AXIOMNEXUS_HTTP_ADDR=127.0.0.1:3001 cargo run -- serve
 | `doctor` | DB 연결 및 환경 점검 |
 | `contract check` | live active contract와 company binding 유효성 검사 |
 | `serve` | HTTP 서버 시작 |
+| `scheduler once` | 가장 오래된 queued run 하나를 runtime으로 실행 |
+| `run once <run_id>` | 특정 queued run 하나를 runtime으로 실행 |
 | `replay` | live store에서 decision path 재진입 검증 |
 | `export` | 현재 Surreal store snapshot을 JSON으로 저장 |
 | `import` | snapshot JSON을 현재 Surreal store로 복원 |
@@ -95,8 +99,8 @@ AXIOMNEXUS_HTTP_ADDR=127.0.0.1:3001 cargo run -- serve
 cargo fmt --all --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
-scripts/smoke-runtime.sh
 scripts/verify-runtime.sh
+scripts/verify-release.sh
 ```
 
 ## 문서
@@ -106,6 +110,8 @@ scripts/verify-runtime.sh
 - [청사진](docs/02-BLUEPRINT.md) — 구조와 제어 흐름
 - [도메인 모델과 불변식](docs/03-DOMAIN-AND-INVARIANTS.md) — 핵심 모델 기준
 - [저장소 계약](docs/spec/STOREPORT-SEMANTIC-CONTRACT.md) — store 의미론 기준
+- [릴리스 체크리스트](RELEASE-CHECKLIST.md) — ship-now release 절차
+- [릴리스 노트 템플릿](docs/RELEASE-NOTES-TEMPLATE.md) — 배포 기록 형식
 
 ## 현재 제한
 

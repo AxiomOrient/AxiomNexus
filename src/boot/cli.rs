@@ -1,8 +1,10 @@
 use super::BootError;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Serve,
+    SchedulerOnce,
+    RunOnce(String),
     Migrate,
     Doctor,
     Replay,
@@ -18,6 +20,17 @@ where
     let mut args = args.into_iter();
     let command = match args.next().as_deref() {
         Some("serve") => Command::Serve,
+        Some("scheduler") => match args.next().as_deref() {
+            Some("once") => Command::SchedulerOnce,
+            _ => return Err(BootError::Cli(usage())),
+        },
+        Some("run") => match args.next() {
+            Some(action) if action == "once" => match args.next() {
+                Some(run_id) if !run_id.is_empty() => Command::RunOnce(run_id),
+                _ => return Err(BootError::Cli(usage())),
+            },
+            _ => return Err(BootError::Cli(usage())),
+        },
         Some("migrate") => Command::Migrate,
         Some("doctor") => Command::Doctor,
         Some("replay") => Command::Replay,
@@ -48,6 +61,8 @@ fn usage() -> String {
         "",
         "commands:",
         "  serve",
+        "  scheduler once",
+        "  run once <run_id>",
         "  migrate",
         "  doctor",
         "  replay",

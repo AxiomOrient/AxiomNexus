@@ -13,6 +13,8 @@ mod tests {
         path::{Path, PathBuf},
     };
 
+    use serde_json::Value;
+
     const CANONICAL_EXECUTE_TURN_SCHEMA_PATH: &str = "samples/execute-turn-output.schema.json";
     const CANONICAL_TRANSITION_SCHEMA_PATH: &str = "samples/transition-intent.schema.json";
     const CANONICAL_DEMO_CONTRACT_SAMPLE_PATH: &str = "samples/company-rust-contract.example.json";
@@ -188,6 +190,52 @@ mod tests {
     }
 
     #[test]
+    fn transition_intent_schema_gate_is_live_contract() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let schema = load_schema(repo_root, CANONICAL_TRANSITION_SCHEMA_PATH);
+
+        assert_eq!(schema["title"], "TransitionIntent");
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["additionalProperties"], false);
+        assert!(schema["required"]
+            .as_array()
+            .expect("required should be an array")
+            .iter()
+            .any(|item| item == "work_id"));
+        assert!(schema["required"]
+            .as_array()
+            .expect("required should be an array")
+            .iter()
+            .any(|item| item == "proof_hints"));
+        assert_eq!(schema["properties"]["kind"]["enum"][0], "propose_progress");
+        assert_eq!(schema["properties"]["kind"]["enum"][2], "block");
+    }
+
+    #[test]
+    fn execute_turn_output_schema_gate_is_live_contract() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let schema = load_schema(repo_root, CANONICAL_EXECUTE_TURN_SCHEMA_PATH);
+
+        assert_eq!(schema["title"], "ExecuteTurnOutcome");
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["additionalProperties"], false);
+        assert!(schema["required"]
+            .as_array()
+            .expect("required should be an array")
+            .iter()
+            .any(|item| item == "observations"));
+        assert_eq!(
+            schema["properties"]["result"]["properties"]["intent"]["title"],
+            "TransitionIntent"
+        );
+        assert!(schema["properties"]["observations"]["required"]
+            .as_array()
+            .expect("required should be an array")
+            .iter()
+            .any(|item| item == "command_results"));
+    }
+
+    #[test]
     fn cargo_manifest_stays_single_root_package() {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let manifest =
@@ -261,5 +309,12 @@ mod tests {
         }
         files.sort();
         files
+    }
+
+    fn load_schema(repo_root: &Path, path: &str) -> Value {
+        serde_json::from_str(
+            &fs::read_to_string(repo_root.join(path)).expect("schema file should load"),
+        )
+        .expect("schema should parse as json")
     }
 }

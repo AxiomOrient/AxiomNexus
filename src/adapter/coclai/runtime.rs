@@ -1,17 +1,16 @@
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    env, fs,
     io::Read,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
 
-#[cfg(test)]
-use std::collections::VecDeque;
-
 use coclai::runtime::{Client, ClientError, PromptRunError, RpcError, SessionConfig};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
@@ -36,7 +35,6 @@ pub(crate) struct CoclaiRuntime {
 
 enum RuntimeBackend {
     Live(Box<LiveRuntime>),
-    #[cfg(test)]
     Scripted(RefCell<VecDeque<ScriptedReply>>),
 }
 
@@ -54,6 +52,8 @@ struct LiveClient {
 const COMMAND_OUTPUT_LIMIT: usize = 4096;
 const COMMAND_TIMEOUT_EXIT_CODE: i32 = 124;
 const COMMAND_FAILURE_EXIT_CODE: i32 = -1;
+const SCRIPTED_REPLIES_PATH_ENV: &str = "AXIOMNEXUS_COCLAI_SCRIPT_PATH";
+const ALLOW_SCRIPTED_RUNTIME_ENV: &str = "AXIOMNEXUS_ALLOW_SCRIPTED_RUNTIME";
 const GATE_COMMAND_ALLOWLIST: &[&[&str]] = &[
     &["cargo", "fmt", "--all", "--check"],
     &[
@@ -92,7 +92,7 @@ struct ResumeTurn {
     prompt_envelope: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ScriptedReply {
     pub(crate) handle: RuntimeHandle,
     pub(crate) raw_output: String,
@@ -108,9 +108,14 @@ impl CoclaiRuntime {
                 kind: RuntimeErrorKind::Unavailable,
                 message: format!("failed to load coclai assets: {error}"),
             })?;
-        let backend = RuntimeBackend::Live(Box::new(LiveRuntime::new(
-            &assets.transition_intent_schema,
-        )?));
+        let backend = match scripted_replies_path(repo_root) {
+            Some(path) => {
+                RuntimeBackend::Scripted(RefCell::new(load_scripted_replies(&path)?.into()))
+            }
+            None => RuntimeBackend::Live(Box::new(LiveRuntime::new(
+                &assets.transition_intent_schema,
+            )?)),
+        };
         Ok(Self { assets, backend })
     }
 
@@ -208,7 +213,6 @@ impl CoclaiRuntime {
                     RuntimeBackend::Live(_) => {
                         collect_observations(&req.cwd, &result.intent, &req.gate_plan)
                     }
-                    #[cfg(test)]
                     RuntimeBackend::Scripted(_) => {
                         scripted_observations(&result.intent, &req.gate_plan)
                     }
@@ -238,7 +242,6 @@ impl CoclaiRuntime {
     fn start_turn(&self, req: StartTurn) -> Result<RuntimeHandle, RuntimeError> {
         match &self.backend {
             RuntimeBackend::Live(live) => live.start(req),
-            #[cfg(test)]
             RuntimeBackend::Scripted(replies) => replies
                 .borrow()
                 .front()
@@ -260,7 +263,6 @@ impl CoclaiRuntime {
 
         match &self.backend {
             RuntimeBackend::Live(live) => live.resume(req),
-            #[cfg(test)]
             RuntimeBackend::Scripted(replies) => replies
                 .borrow()
                 .front()
@@ -275,7 +277,6 @@ impl CoclaiRuntime {
     fn result_turn(&self, handle: RuntimeHandle) -> Result<RuntimeResult, RuntimeError> {
         match &self.backend {
             RuntimeBackend::Live(live) => live.result(handle),
-            #[cfg(test)]
             RuntimeBackend::Scripted(replies) => {
                 let reply = replies
                     .borrow_mut()
@@ -296,7 +297,6 @@ impl CoclaiRuntime {
     }
 }
 
-#[cfg(test)]
 fn scripted_observations(
     intent: &TransitionIntent,
     gate_plan: &[crate::port::runtime::GateCommandSpec],
@@ -325,6 +325,56 @@ fn scripted_observations(
         artifact_refs: Vec::new(),
         notes: None,
     }
+}
+
+fn scripted_replies_path(repo_root: &Path) -> Option<PathBuf> {
+    if !allow_scripted_runtime() {
+        return None;
+    }
+
+    env::var_os(SCRIPTED_REPLIES_PATH_ENV).map(|value| {
+        let path = PathBuf::from(value);
+        if path.is_absolute() {
+            path
+        } else {
+            repo_root.join(path)
+        }
+    })
+}
+
+fn allow_scripted_runtime() -> bool {
+    matches!(
+        env::var(ALLOW_SCRIPTED_RUNTIME_ENV).ok().as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES")
+    )
+}
+
+fn load_scripted_replies(path: &Path) -> Result<Vec<ScriptedReply>, RuntimeError> {
+    let raw = fs::read_to_string(path).map_err(|error| RuntimeError {
+        kind: RuntimeErrorKind::Unavailable,
+        message: format!(
+            "failed to read scripted coclai replies from {}: {error}",
+            path.display()
+        ),
+    })?;
+    let replies =
+        serde_json::from_str::<Vec<ScriptedReply>>(&raw).map_err(|error| RuntimeError {
+            kind: RuntimeErrorKind::InvalidOutput,
+            message: format!(
+                "failed to parse scripted coclai replies from {}: {error}",
+                path.display()
+            ),
+        })?;
+    if replies.is_empty() {
+        return Err(RuntimeError {
+            kind: RuntimeErrorKind::Unavailable,
+            message: format!(
+                "scripted coclai replies file {} must contain at least one reply",
+                path.display()
+            ),
+        });
+    }
+    Ok(replies)
 }
 
 fn collect_observations(
@@ -806,7 +856,7 @@ fn is_invalid_session_rpc(error: &RpcError) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{env, fs, path::Path, process::Command, time::SystemTime};
+    use std::{env, fs, path::Path, process::Command, sync::Mutex, time::SystemTime};
 
     use crate::{
         adapter::coclai::assets::{
@@ -825,12 +875,16 @@ mod tests {
         },
     };
 
-    use super::{CoclaiRuntime, ScriptedReply};
+    use super::{
+        CoclaiRuntime, RuntimeBackend, ScriptedReply, ALLOW_SCRIPTED_RUNTIME_ENV,
+        SCRIPTED_REPLIES_PATH_ENV,
+    };
     use crate::adapter::coclai::assets::RuntimeAssets;
 
     const WORK_ID: &str = "11111111-1111-4111-8111-111111111111";
     const AGENT_ID: &str = "22222222-2222-4222-8222-222222222222";
     const LEASE_ID: &str = "33333333-3333-4333-8333-333333333333";
+    static SCRIPTED_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn from_repo_root_loads_canonical_runtime_assets() {
@@ -857,6 +911,46 @@ mod tests {
             fs::read_to_string(repo_root.join(EXECUTE_TURN_OUTPUT_SCHEMA_PATH))
                 .expect("execute turn schema asset should load")
         );
+    }
+
+    #[test]
+    fn from_repo_root_ignores_scripted_runtime_without_explicit_allow_flag() {
+        let _guard = SCRIPTED_ENV_LOCK.lock().expect("env lock should work");
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let script_path = repo_root.join("samples/transition-intent.schema.json");
+        let previous_script = env::var_os(SCRIPTED_REPLIES_PATH_ENV);
+        let previous_allow = env::var_os(ALLOW_SCRIPTED_RUNTIME_ENV);
+
+        env::set_var(SCRIPTED_REPLIES_PATH_ENV, &script_path);
+        env::remove_var(ALLOW_SCRIPTED_RUNTIME_ENV);
+
+        let runtime = CoclaiRuntime::from_repo_root(repo_root).expect("runtime should still load");
+
+        assert!(matches!(runtime.backend, RuntimeBackend::Live(_)));
+
+        restore_env(SCRIPTED_REPLIES_PATH_ENV, previous_script);
+        restore_env(ALLOW_SCRIPTED_RUNTIME_ENV, previous_allow);
+    }
+
+    #[test]
+    fn from_repo_root_uses_scripted_runtime_only_with_explicit_allow_flag() {
+        let _guard = SCRIPTED_ENV_LOCK.lock().expect("env lock should work");
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let script_path = temp_scripted_reply_file();
+        let previous_script = env::var_os(SCRIPTED_REPLIES_PATH_ENV);
+        let previous_allow = env::var_os(ALLOW_SCRIPTED_RUNTIME_ENV);
+
+        env::set_var(SCRIPTED_REPLIES_PATH_ENV, &script_path);
+        env::set_var(ALLOW_SCRIPTED_RUNTIME_ENV, "1");
+
+        let runtime =
+            CoclaiRuntime::from_repo_root(repo_root).expect("scripted runtime should load");
+
+        assert!(matches!(runtime.backend, RuntimeBackend::Scripted(_)));
+
+        restore_env(SCRIPTED_REPLIES_PATH_ENV, previous_script);
+        restore_env(ALLOW_SCRIPTED_RUNTIME_ENV, previous_allow);
+        let _ = fs::remove_file(script_path);
     }
 
     #[test]
@@ -1080,6 +1174,39 @@ mod tests {
             intent: intent(TransitionKind::Complete, Some("fixed".to_owned())),
             usage: usage(),
             invalid_session: false,
+        }
+    }
+
+    fn temp_scripted_reply_file() -> std::path::PathBuf {
+        let path = env::temp_dir().join(format!(
+            "axiomnexus-scripted-runtime-{}.json",
+            std::process::id()
+        ));
+        let reply = serde_json::json!([{
+            "handle": { "runtime_session_id": "scripted-test" },
+            "raw_output": valid_output("propose_progress", None, true),
+            "intent": serde_json::from_str::<serde_json::Value>(&valid_output("propose_progress", None, true))
+                .expect("valid output should parse"),
+            "usage": {
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "run_seconds": 1,
+                "estimated_cost_cents": 1
+            },
+            "invalid_session": false
+        }]);
+        fs::write(
+            &path,
+            serde_json::to_vec(&reply).expect("scripted reply json should encode"),
+        )
+        .expect("scripted reply file should write");
+        path
+    }
+
+    fn restore_env(key: &str, value: Option<std::ffi::OsString>) {
+        match value {
+            Some(value) => env::set_var(key, value),
+            None => env::remove_var(key),
         }
     }
 

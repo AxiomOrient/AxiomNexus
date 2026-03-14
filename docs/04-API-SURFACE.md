@@ -9,7 +9,7 @@
 
 ## CLI
 
-현재 README가 선언한 CLI는 유지한다. [R1]
+현재 canonical auto path는 HTTP execute endpoint가 아니라 CLI `scheduler once` / `run once <run_id>`다. [R1]
 
 ### bootstrap / maintenance
 - `migrate`
@@ -20,6 +20,8 @@
 
 ### runtime / serving
 - `serve`
+- `scheduler once`
+- `run once <run_id>`
 - `replay`
 
 ### 이후에도 추가하지 않을 것
@@ -32,16 +34,16 @@
 ## HTTP Query
 
 ### bootstrap / admin read
-- `GET /companies/:company_id`
-- `GET /contracts/:company_id/active`
-- `GET /agents/:agent_id`
+- `GET /api/companies`
+- `GET /api/contracts/active`
+- `GET /api/agents`
 
 ### work / run read
-- `GET /works`
-- `GET /works/:work_id`
-- `GET /runs/:run_id`
-- `GET /board`
-- `GET /activity`
+- `GET /api/work`
+- `GET /api/work/{id}`
+- `GET /api/runs/{id}`
+- `GET /api/board`
+- `GET /api/activity`
 
 ### rationale
 - board / activity / work detail는 read model이다. [R2][R3]
@@ -52,23 +54,25 @@
 ## HTTP Command
 
 ### bootstrap / admin write
-- `POST /companies`
-- `POST /contracts/draft`
-- `POST /contracts/activate`
-- `POST /agents`
-- `POST /agents/:agent_id/pause`
-- `POST /agents/:agent_id/resume`
-- `POST /works`
-- `POST /works/:work_id/update`
+- `POST /api/companies`
+- `POST /api/contracts`
+- `POST /api/contracts/{id}/activate`
+- `POST /api/agents`
+- `POST /api/agents/{id}/pause`
+- `POST /api/agents/{id}/resume`
+- `POST /api/work`
+- `POST /api/work/{id}/edit`
 
 ### runtime control
-- `POST /works/:work_id/queue`
-- `POST /works/:work_id/wake`
-- `POST /works/:work_id/claim`
-- `POST /runs/:run_id/execute`
-- `POST /intents`
+- `POST /api/work/{id}/queue`
+- `POST /api/work/{id}/wake`
+- `POST /api/work/{id}/reopen`
+- `POST /api/work/{id}/cancel`
+- `POST /api/work/{id}/override`
+- `POST /api/work/{id}/intents`
 
-여기서 핵심 write authority는 결국 `/intents` 와 `commit_decision` 흐름이다.  
+여기서 queued run을 실제로 소비하는 auto path는 `cargo run -- scheduler once`이고, 배포 검증용 직접 실행 경로는 `cargo run -- run once <run_id>`다.  
+핵심 write authority는 결국 `/api/work/{id}/intents`와 `commit_decision` 흐름이다.  
 다른 command도 최종적으로는 동일한 decision path 또는 같은 store semantics로 수렴해야 한다. [R1][R2]
 
 ---

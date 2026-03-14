@@ -5,14 +5,21 @@ use std::{
 
 use crate::{
     adapter::{
-        coclai::assets::{
-            RuntimeAssets, AGENTS_ASSET_PATH, EXECUTE_TURN_OUTPUT_SCHEMA_PATH,
-            TRANSITION_EXECUTOR_SKILL_PATH, TRANSITION_INTENT_SCHEMA_PATH,
+        coclai::{
+            assets::{
+                RuntimeAssets, AGENTS_ASSET_PATH, EXECUTE_TURN_OUTPUT_SCHEMA_PATH,
+                TRANSITION_EXECUTOR_SKILL_PATH, TRANSITION_INTENT_SCHEMA_PATH,
+            },
+            runtime::CoclaiRuntime,
         },
         http::{routes::all_routes, server::serve as serve_http, transport::HttpTransport},
         surreal::store::{SurrealStore, DEFAULT_DATABASE, DEFAULT_NAMESPACE},
     },
-    app::cmd::RUNTIME_RESUME_POLICY,
+    app::cmd::{
+        run_scheduler::{handle_run_scheduler, RunSchedulerCmd},
+        run_turn_once::{handle_run_turn_once, RunTurnOnceReq},
+        RUNTIME_RESUME_POLICY,
+    },
     model::ContractSetStatus,
     port::store::{CompanyReadModel, ContractsReadModel, QueryStorePort, ReplayStorePort},
 };
@@ -37,6 +44,43 @@ pub fn dispatch(command: Command, config: &Config) -> Result<(), BootError> {
             stdout.flush()?;
             let transport = HttpTransport::new(SurrealStore::open(store_url)?);
             serve_http(transport, &config.http_bind_addr)?;
+        }
+        Command::SchedulerOnce => {
+            let (store_url, store, runtime, cwd) = open_live_runtime(config)?;
+            let ack = handle_run_scheduler(&store, &runtime, RunSchedulerCmd { cwd })?;
+            writeln!(
+                stdout,
+                "axiomnexus scheduler once live; data dir: {}; store_url={}; queue_policy={}; run_id={}; runtime_session_id={}; repair_count={}; session_reset_reason={}",
+                config.data_dir.display(),
+                store_url,
+                ack.queue_policy,
+                ack.run_id.as_deref().unwrap_or("-"),
+                ack.runtime_session_id.as_deref().unwrap_or("-"),
+                ack.repair_count,
+                session_reset_reason_label(ack.session_reset_reason)
+            )?;
+        }
+        Command::RunOnce(run_id) => {
+            let (store_url, store, runtime, cwd) = open_live_runtime(config)?;
+            let ack = handle_run_turn_once(
+                &store,
+                &runtime,
+                RunTurnOnceReq {
+                    run_id: crate::model::RunId::from(run_id),
+                    cwd,
+                },
+            )?;
+            writeln!(
+                stdout,
+                "axiomnexus run once live; data dir: {}; store_url={}; run_id={}; work_id={}; runtime_session_id={}; repair_count={}; session_reset_reason={}",
+                config.data_dir.display(),
+                store_url,
+                ack.run_id,
+                ack.work_id,
+                ack.runtime_session_id,
+                ack.repair_count,
+                session_reset_reason_label(ack.session_reset_reason)
+            )?;
         }
         Command::Migrate => {
             let store_url = surreal_store_url(config)?;
@@ -340,6 +384,22 @@ fn surreal_store_url(config: &Config) -> Result<&str, BootError> {
             config.store_url
         )))
     }
+}
+
+fn open_live_runtime(
+    config: &Config,
+) -> Result<(String, SurrealStore, CoclaiRuntime, String), BootError> {
+    let store_url = surreal_store_url(config)?.to_owned();
+    let store = SurrealStore::open(&store_url)?;
+    let runtime = CoclaiRuntime::from_repo_root(Path::new(env!("CARGO_MANIFEST_DIR")))?;
+    let cwd = std::env::current_dir()?.display().to_string();
+    Ok((store_url, store, runtime, cwd))
+}
+
+fn session_reset_reason_label(reason: Option<crate::model::SessionInvalidationReason>) -> String {
+    reason
+        .map(|value| format!("{value:?}").to_lowercase())
+        .unwrap_or_else(|| "-".to_owned())
 }
 
 #[cfg(test)]

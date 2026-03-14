@@ -13,7 +13,4 @@ cargo clippy --all-targets --all-features -- -D warnings
 echo "[3/4] cargo test"
 cargo test
 
-echo "[4/4] scripts/smoke-runtime.sh"
-scripts/smoke-runtime.sh
-
 echo "verify-runtime ok"

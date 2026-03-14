@@ -6,12 +6,12 @@ TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/axiomnexus-smoke.XXXXXX")"
 DATA_DIR="$TMP_DIR/data"
 PORT="$((4100 + ($$ % 400)))"
 BASE_URL="http://127.0.0.1:${PORT}"
+PROOF_FILE="smoke-runtime-proof.txt"
+REPLIES_PATH="$TMP_DIR/scripted-replies.json"
 
 cleanup() {
-  if [[ -n "${SERVER_PID:-}" ]]; then
-    kill "${SERVER_PID}" >/dev/null 2>&1 || true
-    wait "${SERVER_PID}" >/dev/null 2>&1 || true
-  fi
+  stop_server
+  rm -f "$ROOT_DIR/$PROOF_FILE"
   rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT
@@ -48,35 +48,158 @@ http_json() {
   fi
 }
 
+http_json_any() {
+  local method="$1"
+  local path="$2"
+  local body="${3:-}"
+  if [[ -n "$body" ]]; then
+    curl -s -X "$method" "$BASE_URL$path" \
+      -H 'content-type: application/json' \
+      --data "$body"
+  else
+    curl -s -X "$method" "$BASE_URL$path"
+  fi
+}
+
+start_server() {
+  AXIOMNEXUS_DATA_DIR="$DATA_DIR" \
+  AXIOMNEXUS_HTTP_ADDR="127.0.0.1:${PORT}" \
+    cargo run --quiet -- serve >"$TMP_DIR/serve.log" 2>&1 &
+  SERVER_PID=$!
+
+  for _ in $(seq 1 50); do
+    if curl -sf "$BASE_URL/api/board" >/dev/null 2>&1; then
+      break
+    fi
+    sleep 0.2
+  done
+  curl -sf "$BASE_URL/api/board" >/dev/null
+}
+
+stop_server() {
+  if [[ -n "${SERVER_PID:-}" ]]; then
+    kill "${SERVER_PID}" >/dev/null 2>&1 || true
+    wait "${SERVER_PID}" >/dev/null 2>&1 || true
+    unset SERVER_PID
+  fi
+}
+
+queued_run_id_for_work() {
+  local work_id="$1"
+  python3 -c 'import json,sys
+work_id = sys.argv[1]
+items = json.load(sys.stdin)["data"]["recent_runs"]
+for item in items:
+    if item["work_id"] == work_id and item["status"] == "queued":
+        print(item["run_id"])
+        break
+else:
+    raise SystemExit("queued run not found")' "$work_id"
+}
+
+lease_id_for_run() {
+  python3 -c 'import sys
+run_id = sys.argv[1]
+hex_bytes = "".join(f"{byte:02x}" for byte in run_id.encode())
+suffix = hex_bytes[-12:].rjust(12, "0")
+print(f"00000000-0000-4000-8000-{suffix}")' "$1"
+}
+
+write_replies() {
+  local path="$1"
+  local work_id="$2"
+  local agent_id="$3"
+  local lease_id="$4"
+  local expected_rev="$5"
+  local runtime_session_id="$6"
+  local summary="$7"
+  local proof_file="$8"
+  local resolved_obligation="$9"
+  local invalid_first="${10}"
+
+  python3 - <<'PY' "$path" "$work_id" "$agent_id" "$lease_id" "$expected_rev" "$runtime_session_id" "$summary" "$proof_file" "$resolved_obligation" "$invalid_first"
+import json, sys
+
+(
+    path,
+    work_id,
+    agent_id,
+    lease_id,
+    expected_rev,
+    runtime_session_id,
+    summary,
+    proof_file,
+    resolved_obligation,
+    invalid_first,
+) = sys.argv[1:]
+
+resolved = [resolved_obligation] if resolved_obligation else []
+intent = {
+    "work_id": work_id,
+    "agent_id": agent_id,
+    "lease_id": lease_id,
+    "expected_rev": int(expected_rev),
+    "kind": "complete",
+    "patch": {
+        "summary": summary,
+        "resolved_obligations": resolved,
+        "declared_risks": [],
+    },
+    "note": None,
+    "proof_hints": [
+        {"kind": "summary", "value": summary},
+        {"kind": "file", "value": proof_file},
+    ],
+}
+reply = {
+    "handle": {"runtime_session_id": runtime_session_id},
+    "raw_output": json.dumps(intent, separators=(",", ":")),
+    "intent": intent,
+    "usage": {
+        "input_tokens": 21,
+        "output_tokens": 13,
+        "run_seconds": 1,
+        "estimated_cost_cents": 2,
+    },
+    "invalid_session": False,
+}
+replies = [reply]
+if invalid_first == "1":
+    replies = [{
+        "handle": {"runtime_session_id": "runtime-invalid-session"},
+        "raw_output": "",
+        "intent": intent,
+        "usage": {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "run_seconds": 0,
+            "estimated_cost_cents": 0,
+        },
+        "invalid_session": True,
+    }, reply]
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump(replies, fh, separators=(",", ":"))
+PY
+}
+
 mkdir -p "$DATA_DIR"
 
-echo "[1/8] migrate"
+echo "[1/12] migrate"
 migrate_output="$(run_cli cargo run --quiet -- migrate)"
 printf '%s\n' "$migrate_output" | grep -q "axiomnexus migrate live"
 
-echo "[2/8] doctor"
+echo "[2/12] doctor"
 doctor_output="$(run_cli cargo run --quiet -- doctor)"
 printf '%s\n' "$doctor_output" | grep -q "axiomnexus doctor live"
 
-echo "[3/8] contract check"
+echo "[3/12] contract check"
 contract_check_output="$(run_cli cargo run --quiet -- contract check)"
 printf '%s\n' "$contract_check_output" | grep -q "axiomnexus contract check live"
 
-echo "[4/8] serve"
-AXIOMNEXUS_DATA_DIR="$DATA_DIR" \
-AXIOMNEXUS_HTTP_ADDR="127.0.0.1:${PORT}" \
-  cargo run --quiet -- serve >"$TMP_DIR/serve.log" 2>&1 &
-SERVER_PID=$!
+echo "[4/12] serve"
+start_server
 
-for _ in $(seq 1 50); do
-  if curl -sf "$BASE_URL/api/board" >/dev/null 2>&1; then
-    break
-  fi
-  sleep 0.2
-done
-curl -sf "$BASE_URL/api/board" >/dev/null
-
-echo "[5/8] onboarding"
+echo "[5/12] onboarding and queue"
 contracts_json="$(http_json GET /api/contracts/active)"
 rules_json="$(printf '%s' "$contracts_json" | json_get "data.rules")"
 
@@ -110,10 +233,9 @@ for item in items:
         break
 ' "$company_id")"
 
-work_json="$(http_json POST /api/work "{\"company_id\":\"${company_id}\",\"parent_id\":null,\"kind\":\"task\",\"title\":\"Smoke Task\",\"body\":\"queue via smoke\",\"contract_set_id\":\"${contract_set_id}\"}")"
+work_json="$(http_json POST /api/work "{\"company_id\":\"${company_id}\",\"parent_id\":null,\"kind\":\"task\",\"title\":\"Smoke Task\",\"body\":\"runtime smoke accepted path\",\"contract_set_id\":\"${contract_set_id}\"}")"
 work_id="$(printf '%s' "$work_json" | json_get "work_id")"
 
-echo "[6/8] queue"
 queue_body="$(python3 - <<'PY' "$work_id" "$agent_id"
 import json, sys
 print(json.dumps({
@@ -136,36 +258,144 @@ queue_response="$(http_json POST "/api/work/${work_id}/queue" "$queue_body")"
 printf '%s' "$queue_response" | grep -q '"outcome":"accepted"\|"outcome":"override_accepted"'
 queued_detail="$(http_json GET "/api/work/${work_id}")"
 printf '%s' "$queued_detail" | grep -q '"status":"todo"'
-printf '%s' "$queued_detail" | grep -q '"rev":1'
+before_rev="$(printf '%s' "$queued_detail" | python3 -c 'import json,sys
+print(json.load(sys.stdin)["data"]["items"][0]["rev"])')"
 
-echo "[7/8] runtime intent turn"
-intent_body="$(python3 - <<'PY' "$work_id" "$agent_id"
+echo "[6/12] wake queued work"
+wake_body='{"latest_reason":"runtime smoke","obligation_delta":["runtime smoke follow up"]}'
+wake_response="$(http_json POST "/api/work/${work_id}/wake" "$wake_body")"
+printf '%s' "$wake_response" | grep -q '"queue_policy"'
+
+agents_json="$(http_json GET /api/agents)"
+run_id="$(printf '%s' "$agents_json" | queued_run_id_for_work "$work_id")"
+lease_id="$(lease_id_for_run "$run_id")"
+
+echo "[7/12] run once accepted complete"
+printf 'smoke proof\n' >"$ROOT_DIR/$PROOF_FILE"
+expected_rev="$((before_rev + 1))"
+write_replies \
+  "$REPLIES_PATH" \
+  "$work_id" \
+  "$agent_id" \
+  "$lease_id" \
+  "$expected_rev" \
+  "runtime-smoke-1" \
+  "runtime smoke complete" \
+  "$PROOF_FILE" \
+  "runtime smoke follow up" \
+  "0"
+stop_server
+scheduler_output="$(AXIOMNEXUS_ALLOW_SCRIPTED_RUNTIME=1 AXIOMNEXUS_COCLAI_SCRIPT_PATH="$REPLIES_PATH" run_cli cargo run --quiet -- run once "$run_id")"
+printf '%s\n' "$scheduler_output" | grep -q "axiomnexus run once live"
+printf '%s\n' "$scheduler_output" | grep -q "run_id=${run_id}"
+printf '%s\n' "$scheduler_output" | grep -q "repair_count=0"
+start_server
+
+echo "[8/12] verify accepted path evidence"
+done_detail="$(http_json GET "/api/work/${work_id}")"
+printf '%s' "$done_detail" | grep -q '"status":"done"'
+after_rev="$(printf '%s' "$done_detail" | python3 -c 'import json,sys
+print(json.load(sys.stdin)["data"]["items"][0]["rev"])')"
+if [[ "$after_rev" -le "$before_rev" ]]; then
+  echo "expected work rev to increase after runtime execute"
+  exit 1
+fi
+
+run_detail="$(http_json GET "/api/runs/${run_id}")"
+printf '%s' "$run_detail" | grep -q '"status":"completed"'
+printf '%s' "$run_detail" | grep -q '"runtime_session_id":"runtime-smoke-1"'
+
+board_json="$(http_json GET /api/board)"
+printf '%s' "$board_json" | grep -q "\"work_id\":\"${work_id}\""
+printf '%s' "$board_json" | grep -q '"kind":"complete"'
+printf '%s' "$board_json" | grep -q '"summary":"Complete Accepted with next status Done"'
+printf '%s' "$board_json" | grep -q '"total_turns":1'
+
+activity_json="$(http_json GET /api/activity)"
+printf '%s' "$activity_json" | grep -q '"event_kind":"transition"'
+printf '%s' "$activity_json" | grep -q '"summary":"Complete Accepted with next status Done"'
+
+echo "[9/12] invalid-session repair"
+reopen_body="$(python3 - <<'PY' "$work_id" "$agent_id" "$after_rev"
+import json, sys
+print(json.dumps({
+    "work_id": sys.argv[1],
+    "agent_id": sys.argv[2],
+    "lease_id": "board-lease",
+    "expected_rev": int(sys.argv[3]),
+    "kind": "reopen",
+    "patch": {
+        "summary": "",
+        "resolved_obligations": [],
+        "declared_risks": [],
+    },
+    "note": "reopen for repair smoke",
+    "proof_hints": [{"kind": "summary", "value": "reopen for repair smoke"}],
+}, separators=(",", ":")))
+PY
+)"
+reopen_response="$(http_json POST "/api/work/${work_id}/reopen" "$reopen_body")"
+printf '%s' "$reopen_response" | grep -q '"outcome":"accepted"\|"outcome":"override_accepted"'
+reopened_detail="$(http_json GET "/api/work/${work_id}")"
+printf '%s' "$reopened_detail" | grep -q '"status":"todo"'
+reopened_rev="$(printf '%s' "$reopened_detail" | python3 -c 'import json,sys
+print(json.load(sys.stdin)["data"]["items"][0]["rev"])')"
+
+repair_wake='{"latest_reason":"repair smoke","obligation_delta":["repair smoke follow up"]}'
+http_json POST "/api/work/${work_id}/wake" "$repair_wake" >/dev/null
+repair_agents_json="$(http_json GET /api/agents)"
+repair_run_id="$(printf '%s' "$repair_agents_json" | queued_run_id_for_work "$work_id")"
+repair_lease_id="$(lease_id_for_run "$repair_run_id")"
+repair_expected_rev="$((reopened_rev + 1))"
+write_replies \
+  "$REPLIES_PATH" \
+  "$work_id" \
+  "$agent_id" \
+  "$repair_lease_id" \
+  "$repair_expected_rev" \
+  "runtime-smoke-2" \
+  "runtime smoke repaired" \
+  "$PROOF_FILE" \
+  "repair smoke follow up" \
+  "1"
+stop_server
+repair_output="$(AXIOMNEXUS_ALLOW_SCRIPTED_RUNTIME=1 AXIOMNEXUS_COCLAI_SCRIPT_PATH="$REPLIES_PATH" run_cli cargo run --quiet -- run once "$repair_run_id")"
+printf '%s\n' "$repair_output" | grep -q "run_id=${repair_run_id}"
+printf '%s\n' "$repair_output" | grep -q "session_reset_reason=runtime"
+start_server
+
+repair_run_detail="$(http_json GET "/api/runs/${repair_run_id}")"
+printf '%s' "$repair_run_detail" | grep -q '"status":"completed"'
+printf '%s' "$repair_run_detail" | grep -q '"runtime_session_id":"runtime-smoke-2"'
+
+repair_board="$(http_json GET /api/board)"
+printf '%s' "$repair_board" | grep -q '"total_turns":2'
+
+echo "[10/12] failure path reject/conflict"
+bad_intent="$(python3 - <<'PY' "$work_id" "$agent_id"
 import json, sys
 print(json.dumps({
     "work_id": sys.argv[1],
     "agent_id": sys.argv[2],
     "lease_id": "missing-lease",
-    "expected_rev": 1,
+    "expected_rev": 0,
     "kind": "propose_progress",
     "patch": {
-        "summary": "smoke runtime turn",
+        "summary": "runtime failure smoke",
         "resolved_obligations": [],
         "declared_risks": [],
     },
     "note": None,
-    "proof_hints": [{"kind": "summary", "value": "smoke runtime turn"}],
+    "proof_hints": [{"kind": "summary", "value": "runtime failure smoke"}],
 }, separators=(",", ":")))
 PY
 )"
-intent_response="$(http_json POST "/api/work/${work_id}/intents" "$intent_body")"
-printf '%s' "$intent_response" | grep -q '"outcome":"rejected"\|"outcome":"conflict"'
+bad_response="$(http_json_any POST "/api/work/${work_id}/intents" "$bad_intent")"
+printf '%s' "$bad_response" | grep -q '"error"\|"outcome":"rejected"\|"outcome":"conflict"'
 
-kill "${SERVER_PID}" >/dev/null 2>&1 || true
-wait "${SERVER_PID}" >/dev/null 2>&1 || true
-unset SERVER_PID
-
-echo "[8/8] replay"
+echo "[11/12] replay"
+stop_server
 replay_output="$(run_cli cargo run --quiet -- replay)"
 printf '%s\n' "$replay_output" | grep -q "decision_path=transition_record"
 
-echo "smoke-runtime ok"
+echo "[12/12] smoke-runtime ok"

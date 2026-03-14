@@ -1,5 +1,7 @@
 use std::{error::Error, fmt};
 
+use serde::{Deserialize, Serialize};
+
 use crate::model::{
     CommandResult, ConsumptionUsage, EvidenceRef, FileChange, SessionInvalidationReason,
     TaskSession, TransitionIntent, TransitionKind, WorkSnapshot,
@@ -56,7 +58,7 @@ pub(crate) struct RuntimeObservations {
     pub(crate) notes: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RuntimeHandle {
     pub(crate) runtime_session_id: String,
 }

@@ -174,6 +174,11 @@ impl MemoryStore {
     pub(crate) fn claim_lease(&self, req: ClaimLeaseReq) -> Result<ClaimLeaseRes, StoreError> {
         let mut next = self.cloned_state();
         let acquired_at = next.next_timestamp();
+        let snapshot = next
+            .snapshots
+            .get(req.work_id.as_str())
+            .cloned()
+            .ok_or_else(|| not_found("claim_lease", &req.work_id))?;
         let lease = acquire_claim_lease(
             &mut next,
             &req.work_id,
@@ -182,6 +187,10 @@ impl MemoryStore {
             acquired_at,
             "claim_lease",
         )?;
+        let record = claim_transition_record(&snapshot, &lease, acquired_at);
+        next.transition_records.push(record.clone());
+        next.activity_events
+            .push(activity_entry_from_transition(&record));
         self.replace_state(next)?;
 
         Ok(ClaimLeaseRes { lease })
@@ -1823,6 +1832,47 @@ fn acquire_claim_lease(
     Ok(lease)
 }
 
+fn claim_transition_record(
+    snapshot: &WorkSnapshot,
+    lease: &WorkLease,
+    happened_at: SystemTime,
+) -> TransitionRecord {
+    TransitionRecord {
+        record_id: crate::model::RecordId::from(format!(
+            "record-{}-{}-Claim",
+            snapshot.work_id,
+            snapshot.rev + 1
+        )),
+        company_id: snapshot.company_id.clone(),
+        work_id: snapshot.work_id.clone(),
+        actor_kind: ActorKind::Agent,
+        actor_id: ActorId::from(lease.agent_id.as_str()),
+        run_id: lease.run_id.clone(),
+        session_id: None,
+        lease_id: Some(lease.lease_id.clone()),
+        expected_rev: snapshot.rev,
+        contract_set_id: snapshot.contract_set_id.clone(),
+        contract_rev: snapshot.contract_rev,
+        before_status: snapshot.status,
+        after_status: Some(WorkStatus::Doing),
+        outcome: crate::model::DecisionOutcome::Accepted,
+        reasons: Vec::new(),
+        kind: TransitionKind::Claim,
+        patch: crate::model::WorkPatch::default(),
+        gate_results: Vec::new(),
+        evidence: crate::model::EvidenceBundle {
+            observed_agent_status: Some(AgentStatus::Active),
+            observed_agent_company_id: Some(snapshot.company_id.clone()),
+            ..crate::model::EvidenceBundle::default()
+        },
+        evidence_inline: Some(crate::model::EvidenceInline {
+            summary: "Claim Accepted with next status Doing".to_owned(),
+        }),
+        evidence_refs: Vec::new(),
+        happened_at,
+    }
+}
+
 fn has_open_lease_for_work(state: &MemoryState, work_id: &WorkId) -> bool {
     state
         .leases
@@ -2201,10 +2251,18 @@ mod tests {
             .runs
             .get(run_id.as_str())
             .expect("created run should be stored");
+        let claim_record = store
+            .load_transition_records(&WorkId::from(DEMO_TODO_WORK_ID))
+            .expect("claim records should load")
+            .into_iter()
+            .find(|record| record.kind == TransitionKind::Claim)
+            .expect("claim transition should persist");
 
         assert_eq!(run.work_id, WorkId::from(DEMO_TODO_WORK_ID));
         assert_eq!(run.agent_id, AgentId::from(DEMO_AGENT_ID));
         assert_eq!(run.status, RunStatus::Running);
+        assert_eq!(claim_record.expected_rev, 0);
+        assert_eq!(claim_record.after_status, Some(WorkStatus::Doing));
     }
 
     #[test]

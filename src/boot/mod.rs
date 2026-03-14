@@ -72,6 +72,8 @@ mod tests {
 
         for command in [
             "serve",
+            "scheduler once",
+            "run once",
             "migrate",
             "doctor",
             "replay",

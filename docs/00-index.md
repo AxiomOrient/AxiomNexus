@@ -1,6 +1,9 @@
 # AxiomNexus 문서 인덱스
 
-현재 canonical 문서는 runtime/control-plane 제품 표면과 final target을 함께 설명합니다.
+canonical reader path는 두 곳으로 고정한다.
+
+1. root `README.md`
+2. `docs/00-index.md`
 
 먼저 읽을 문서:
 
@@ -12,13 +15,16 @@
 6. `05-QUALITY-GATES.md` — 품질 게이트와 검증 전략
 7. `spec/STOREPORT-SEMANTIC-CONTRACT.md` — 저장소 의미론 기준 계약
 8. `spec/RUNTIMEPORT-EXECUTE-TURN-SPEC.md` — runtime turn 최종 계약
+9. `../RELEASE-CHECKLIST.md` — ship-now release 절차
+10. `RELEASE-NOTES-TEMPLATE.md` — release note 기록 형식
 
 정리 원칙:
 
-- `docs/`가 공식 읽기 표면이다.
+- 새 독자 입구는 root `README.md`와 `docs/00-index.md`만 쓴다.
+- `docs/`는 제품/계약 문서 표면이다.
 - `docs/spec/`는 바뀌면 안 되는 계약 문서다.
 - `docs/adr/`는 구조 결정을 기록한다.
-- `README.md`, `docs/`, `samples/`가 같은 canonical 구조를 말해야 한다.
+- `README.md`, `docs/`, `samples/`, release docs가 같은 canonical 구조를 말해야 한다.
 
 현재 상태를 설명하는 참고 문서:
 

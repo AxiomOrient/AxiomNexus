@@ -458,6 +458,7 @@ impl SurrealStore {
             &lease_record_id(prepared.lease.lease_id.as_str()),
             LeaseDoc::from_model(&prepared.lease),
         )?;
+        let record = claim_transition_record(&snapshot, &prepared.lease, acquired_at_secs)?;
         self.upsert_record(
             &work_record_id(req.work_id.as_str()),
             WorkDoc {
@@ -468,6 +469,14 @@ impl SurrealStore {
                 updated_at_secs: acquired_at_secs,
                 ..snapshot
             },
+        )?;
+        self.upsert_record(
+            &transition_record_id(record.record_id.as_str()),
+            TransitionRecordDoc::from_model(&record)?,
+        )?;
+        self.upsert_record(
+            &activity_event_record_id(record.record_id.as_str()),
+            ActivityEventDoc::from_transition_record(&record),
         )?;
 
         Ok(ClaimLeaseRes {
@@ -3169,6 +3178,47 @@ fn prepare_runnable_run_for_claim(
     Ok((run, run_activity))
 }
 
+fn claim_transition_record(
+    snapshot: &WorkDoc,
+    lease: &WorkLease,
+    happened_at_secs: u64,
+) -> Result<TransitionRecord, StoreError> {
+    Ok(TransitionRecord {
+        record_id: crate::model::RecordId::from(format!(
+            "record-{}-{}-Claim",
+            snapshot.work_id,
+            snapshot.rev + 1
+        )),
+        company_id: CompanyId::from(snapshot.company_id.clone()),
+        work_id: WorkId::from(snapshot.work_id.clone()),
+        actor_kind: ActorKind::Agent,
+        actor_id: crate::model::ActorId::from(lease.agent_id.as_str()),
+        run_id: lease.run_id.clone(),
+        session_id: None,
+        lease_id: Some(lease.lease_id.clone()),
+        expected_rev: snapshot.rev,
+        contract_set_id: ContractSetId::from(snapshot.contract_set_id.clone()),
+        contract_rev: snapshot.contract_rev,
+        before_status: parse_work_status(&snapshot.status)?,
+        after_status: Some(WorkStatus::Doing),
+        outcome: DecisionOutcome::Accepted,
+        reasons: Vec::new(),
+        kind: TransitionKind::Claim,
+        patch: crate::model::WorkPatch::default(),
+        gate_results: Vec::new(),
+        evidence: crate::model::EvidenceBundle {
+            observed_agent_status: Some(AgentStatus::Active),
+            observed_agent_company_id: Some(CompanyId::from(snapshot.company_id.clone())),
+            ..crate::model::EvidenceBundle::default()
+        },
+        evidence_inline: Some(crate::model::EvidenceInline {
+            summary: "Claim Accepted with next status Doing".to_owned(),
+        }),
+        evidence_refs: Vec::new(),
+        happened_at: timestamp(happened_at_secs),
+    })
+}
+
 fn claim_actor_agent_id(
     record: &TransitionRecord,
     capability: &str,
@@ -4026,6 +4076,12 @@ mod tests {
                 lease_id: LeaseId::from("lease-claim-2"),
             })
             .expect_err("second open claim should conflict");
+        let claim_record = store
+            .load_transition_records(&seeded.work_id)
+            .expect("claim records should load")
+            .into_iter()
+            .find(|record| record.kind == TransitionKind::Claim)
+            .expect("claim transition should persist");
 
         assert_eq!(first.lease.lease_id, LeaseId::from("lease-claim-1"));
         assert_eq!(persisted.items[0].status, WorkStatus::Doing);
@@ -4035,6 +4091,8 @@ mod tests {
         );
         assert!(first.lease.run_id.is_some());
         assert_eq!(error.kind, crate::port::store::StoreErrorKind::Conflict);
+        assert_eq!(claim_record.expected_rev, 0);
+        assert_eq!(claim_record.after_status, Some(WorkStatus::Doing));
     }
 
     #[test]
