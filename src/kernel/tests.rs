@@ -10,9 +10,10 @@ use crate::model::{
 };
 
 use super::{
-    advance_session, claim_lease, command_gate_specs, decide_transition, merge_wake,
-    replay_snapshot_from_records, session_invalidation_reason, timeout_requeue_transition,
-    wake_run_plan, WakeRunPlan,
+    advance_session, claim_lease, claim_transition_record, command_gate_specs, decide_transition,
+    merge_wake, next_session_from_decision, replay_snapshot_from_records,
+    session_invalidation_reason, timeout_requeue_transition, transition_record, wake_run_plan,
+    WakeRunPlan,
 };
 
 #[test]
@@ -94,6 +95,142 @@ fn claim_lease_rejects_work_with_open_lease() {
     let snapshot = snapshot(WorkStatus::Todo, Some("lease-open"), 1);
 
     assert_eq!(claim_lease(&snapshot), Err(ReasonCode::LeaseConflict));
+}
+
+#[test]
+fn claim_transition_record_captures_claim_acceptance_defaults() {
+    let snapshot = snapshot(WorkStatus::Todo, None, 4);
+    let lease = lease("lease-1", "agent-1");
+    let happened_at = SystemTime::UNIX_EPOCH + Duration::from_secs(9);
+
+    let record = claim_transition_record(&snapshot, &lease, happened_at);
+
+    assert_eq!(record.record_id, RecordId::from("record-work-1-5-Claim"));
+    assert_eq!(record.actor_kind, ActorKind::Agent);
+    assert_eq!(record.run_id, lease.run_id);
+    assert_eq!(record.lease_id, Some(LeaseId::from("lease-1")));
+    assert_eq!(record.before_status, WorkStatus::Todo);
+    assert_eq!(record.after_status, Some(WorkStatus::Doing));
+    assert_eq!(record.outcome, DecisionOutcome::Accepted);
+    assert_eq!(record.kind, TransitionKind::Claim);
+    assert_eq!(
+        record.evidence.observed_agent_status,
+        Some(AgentStatus::Active)
+    );
+    assert_eq!(
+        record.evidence.observed_agent_company_id,
+        Some(CompanyId::from("company-1"))
+    );
+    assert_eq!(
+        record
+            .evidence_inline
+            .as_ref()
+            .map(|inline| inline.summary.as_str()),
+        Some("Claim Accepted with next status Doing")
+    );
+    assert_eq!(record.happened_at, happened_at);
+}
+
+#[test]
+fn transition_record_uses_runtime_context_and_session_id() {
+    let snapshot = snapshot(WorkStatus::Doing, Some("lease-1"), 4);
+    let lease = lease("lease-1", "agent-1");
+    let intent = intent(TransitionKind::ProposeProgress, 4, "lease-1", None);
+    let decision = decide_transition(
+        &snapshot,
+        Some(&lease),
+        None,
+        &contract(vec![rule(
+            TransitionKind::ProposeProgress,
+            ActorKind::Agent,
+            vec![WorkStatus::Doing],
+            WorkStatus::Doing,
+            LeaseEffect::Keep,
+            vec![GateSpec::LeasePresent, GateSpec::LeaseHeldByActor],
+        )]),
+        &EvidenceBundle::default(),
+        &intent,
+    );
+    let happened_at = SystemTime::UNIX_EPOCH + Duration::from_secs(11);
+
+    let record = transition_record(
+        &snapshot,
+        Some(&lease),
+        &intent,
+        &decision,
+        Some(&SessionId::from("session-1")),
+        happened_at,
+    );
+
+    assert_eq!(record.actor_kind, ActorKind::Agent);
+    assert_eq!(record.actor_id, crate::model::ActorId::from("agent-1"));
+    assert_eq!(record.session_id, Some(SessionId::from("session-1")));
+    assert_eq!(record.run_id, lease.run_id);
+    assert_eq!(record.kind, TransitionKind::ProposeProgress);
+    assert_eq!(record.outcome, DecisionOutcome::Accepted);
+    assert_eq!(record.after_status, Some(WorkStatus::Doing));
+    assert_eq!(record.happened_at, happened_at);
+}
+
+#[test]
+fn next_session_from_decision_updates_gate_summary_from_decision() {
+    let existing = TaskSession {
+        session_id: SessionId::from("session-1"),
+        company_id: CompanyId::from("company-1"),
+        agent_id: AgentId::from("agent-1"),
+        work_id: WorkId::from("work-1"),
+        runtime: RuntimeKind::Coclai,
+        runtime_session_id: "runtime-1".to_owned(),
+        cwd: "/repo".to_owned(),
+        workspace_fingerprint: workspace_fingerprint("/repo"),
+        contract_rev: 1,
+        last_record_id: None,
+        last_decision_summary: Some("old decision".to_owned()),
+        last_gate_summary: None,
+        updated_at: SystemTime::UNIX_EPOCH,
+    };
+    let snapshot = snapshot(WorkStatus::Doing, Some("lease-1"), 1);
+    let lease = lease("lease-1", "agent-1");
+    let mut intent = intent(TransitionKind::Block, 1, "lease-1", None);
+    intent.patch.declared_risks = vec!["waiting".to_owned()];
+    let decision = decide_transition(
+        &snapshot,
+        Some(&lease),
+        None,
+        &contract(vec![rule(
+            TransitionKind::Block,
+            ActorKind::Agent,
+            vec![WorkStatus::Doing],
+            WorkStatus::Blocked,
+            LeaseEffect::Release,
+            vec![
+                GateSpec::LeasePresent,
+                GateSpec::LeaseHeldByActor,
+                GateSpec::ManualNotePresent,
+            ],
+        )]),
+        &EvidenceBundle::default(),
+        &intent,
+    );
+    let record = transition_record(
+        &snapshot,
+        Some(&lease),
+        &intent,
+        &decision,
+        Some(&existing.session_id),
+        SystemTime::UNIX_EPOCH + Duration::from_secs(2),
+    );
+
+    let next =
+        next_session_from_decision(Some(existing), 3, &record, &decision).expect("session remains");
+
+    assert_eq!(next.contract_rev, 3);
+    assert_eq!(next.last_record_id, Some(record.record_id));
+    assert_eq!(next.last_decision_summary.as_deref(), Some("old decision"));
+    assert_eq!(
+        next.last_gate_summary.as_deref(),
+        Some("manual transition requires note")
+    );
 }
 
 #[test]

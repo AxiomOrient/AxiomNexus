@@ -2,17 +2,19 @@ use serde::Serialize;
 
 use crate::{
     model::{
-        AgentStatus, DecisionOutcome, LeaseId, RunId, SessionInvalidationReason, TransitionKind,
+        AgentStatus, DecisionOutcome, EvidenceBundle, LeaseId, RunId, SessionInvalidationReason,
+        TransitionKind,
     },
     port::runtime::RuntimePort,
     port::store::{
-        ClaimLeaseReq, QueuedRunCandidate, RuntimeStorePort, StoreError, StoreErrorKind,
+        ClaimLeaseReq, QueuedRunCandidate, RuntimeStorePort, RuntimeTurnContext, StoreError,
+        StoreErrorKind,
     },
 };
 
 use super::{
     resume_session::{handle_resume_session, ResumeSessionCmd},
-    submit_intent::{collect_runtime_observation_evidence, commit_runtime_intent},
+    submit_intent::{collect_runtime_observation_evidence, commit_runtime_intent, SubmitIntentAck},
     RUNTIME_RESUME_POLICY,
 };
 
@@ -39,100 +41,182 @@ pub(crate) struct RunTurnOnceResp {
     pub(crate) observed_agent_status: Option<crate::model::AgentStatus>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunTurnBase {
+    work_id: String,
+    agent_id: String,
+    pending_wake_count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CommittedRunTurn {
+    resume: super::resume_session::ResumeSessionAck,
+    evidence: EvidenceBundle,
+    commit: SubmitIntentAck,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RunFinalization {
+    KeepRunning,
+    MarkCompleted,
+    MarkFailed {
+        reason: &'static str,
+        error: StoreError,
+    },
+}
+
 pub(crate) fn handle_run_turn_once(
     store: &(impl RuntimeStorePort + crate::port::store::CommandStorePort),
     runtime: &impl RuntimePort,
     req: RunTurnOnceReq,
 ) -> Result<RunTurnOnceResp, StoreError> {
-    let initial_turn = store.load_runtime_turn(&req.run_id)?;
-    if initial_turn.snapshot.active_lease_id.is_none() {
-        let _ = crate::port::store::RuntimeStorePort::claim_lease(
-            store,
-            ClaimLeaseReq {
-                work_id: initial_turn.snapshot.work_id.clone(),
-                agent_id: initial_turn.agent_id.clone(),
-                lease_id: runtime_lease_id(&req.run_id),
-            },
-        )?;
-    }
-    let turn = store.load_runtime_turn(&req.run_id)?;
-    let work_id = turn.snapshot.work_id.to_string();
-    let agent_id = turn.agent_id.to_string();
-    let pending_wake_count = turn.pending_wake.as_ref().map_or(0, |wake| wake.count);
-
-    let ack = handle_resume_session(
-        store,
-        runtime,
-        ResumeSessionCmd {
-            run_id: req.run_id.clone(),
-            cwd: req.cwd,
-        },
-    )?;
-    let context = store.load_context(&turn.snapshot.work_id)?;
-    let evidence = collect_runtime_observation_evidence(store, &ack.observations, &ack.intent)?;
-    match commit_runtime_intent(store, &context, &ack.intent, evidence.clone()) {
-        Ok(commit_ack) => finalize_run_turn(
-            store,
-            &req.run_id,
-            ack.intent_kind,
-            commit_ack.outcome,
-            &commit_ack.summary,
-        )?,
+    let turn = ensure_claimed_turn(store, &req.run_id)?;
+    let turn_base = run_turn_base(&turn);
+    let committed_turn = match resume_and_commit_turn(store, runtime, &req, &turn) {
+        Ok(committed_turn) => committed_turn,
         Err(error) if error.kind == StoreErrorKind::Conflict => {
             store.mark_run_failed(&req.run_id, "decision_conflict")?;
             return Err(error);
         }
         Err(error) => return Err(error),
-    }
+    };
+    apply_run_finalization(
+        store,
+        &req.run_id,
+        run_finalization(
+            committed_turn.resume.intent_kind,
+            committed_turn.commit.outcome,
+            &committed_turn.commit.summary,
+        ),
+    )?;
 
-    Ok(RunTurnOnceResp {
-        runtime_policy: RUNTIME_RESUME_POLICY,
-        run_id: req.run_id.to_string(),
-        work_id,
-        agent_id,
-        pending_wake_count,
-        resumed: ack.resumed,
-        repair_count: ack.repair_count,
-        session_reset_reason: ack.session_reset_reason,
-        runtime_session_id: ack.runtime_session_id,
-        intent_kind: ack.intent_kind,
-        changed_file_count: evidence.changed_files.len(),
-        command_result_count: evidence.command_results.len(),
-        observed_agent_status: evidence.observed_agent_status,
+    Ok(run_turn_response(&req.run_id, turn_base, committed_turn))
+}
+
+fn ensure_claimed_turn(
+    store: &impl RuntimeStorePort,
+    run_id: &RunId,
+) -> Result<RuntimeTurnContext, StoreError> {
+    let initial_turn = store.load_runtime_turn(run_id)?;
+    let Some(claim_req) = claim_request_for_turn(&initial_turn, run_id) else {
+        return Ok(initial_turn);
+    };
+    let _ = crate::port::store::RuntimeStorePort::claim_lease(store, claim_req)?;
+    store.load_runtime_turn(run_id)
+}
+
+fn claim_request_for_turn(turn: &RuntimeTurnContext, run_id: &RunId) -> Option<ClaimLeaseReq> {
+    turn.snapshot
+        .active_lease_id
+        .is_none()
+        .then(|| ClaimLeaseReq {
+            work_id: turn.snapshot.work_id.clone(),
+            agent_id: turn.agent_id.clone(),
+            lease_id: runtime_lease_id(run_id),
+        })
+}
+
+fn run_turn_base(turn: &RuntimeTurnContext) -> RunTurnBase {
+    RunTurnBase {
+        work_id: turn.snapshot.work_id.to_string(),
+        agent_id: turn.agent_id.to_string(),
+        pending_wake_count: turn.pending_wake.as_ref().map_or(0, |wake| wake.count),
+    }
+}
+
+fn resume_and_commit_turn(
+    store: &(impl RuntimeStorePort + crate::port::store::CommandStorePort),
+    runtime: &impl RuntimePort,
+    req: &RunTurnOnceReq,
+    turn: &RuntimeTurnContext,
+) -> Result<CommittedRunTurn, StoreError> {
+    let resume = handle_resume_session(
+        store,
+        runtime,
+        ResumeSessionCmd {
+            run_id: req.run_id.clone(),
+            cwd: req.cwd.clone(),
+        },
+    )?;
+    let context = store.load_context(&turn.snapshot.work_id)?;
+    let evidence =
+        collect_runtime_observation_evidence(store, &resume.observations, &resume.intent)?;
+    let commit = commit_runtime_intent(store, &context, &resume.intent, evidence.clone())?;
+
+    Ok(CommittedRunTurn {
+        resume,
+        evidence,
+        commit,
     })
 }
 
-fn finalize_run_turn(
-    store: &impl RuntimeStorePort,
-    run_id: &RunId,
+fn run_finalization(
     intent_kind: TransitionKind,
     outcome: DecisionOutcome,
     summary: &str,
-) -> Result<(), StoreError> {
+) -> RunFinalization {
     match outcome {
         DecisionOutcome::Accepted | DecisionOutcome::OverrideAccepted => {
             if matches!(
                 intent_kind,
                 TransitionKind::Complete | TransitionKind::Block
             ) {
-                store.mark_run_completed(run_id)?;
+                RunFinalization::MarkCompleted
+            } else {
+                RunFinalization::KeepRunning
             }
-            Ok(())
         }
-        DecisionOutcome::Rejected => {
-            store.mark_run_failed(run_id, "decision_rejected")?;
-            Err(StoreError {
+        DecisionOutcome::Rejected => RunFinalization::MarkFailed {
+            reason: "decision_rejected",
+            error: StoreError {
                 kind: StoreErrorKind::Conflict,
                 message: summary.to_owned(),
-            })
-        }
-        DecisionOutcome::Conflict => {
-            store.mark_run_failed(run_id, "decision_conflict")?;
-            Err(StoreError {
+            },
+        },
+        DecisionOutcome::Conflict => RunFinalization::MarkFailed {
+            reason: "decision_conflict",
+            error: StoreError {
                 kind: StoreErrorKind::Conflict,
                 message: summary.to_owned(),
-            })
+            },
+        },
+    }
+}
+
+fn apply_run_finalization(
+    store: &impl RuntimeStorePort,
+    run_id: &RunId,
+    finalization: RunFinalization,
+) -> Result<(), StoreError> {
+    match finalization {
+        RunFinalization::KeepRunning => Ok(()),
+        RunFinalization::MarkCompleted => store.mark_run_completed(run_id),
+        RunFinalization::MarkFailed { reason, error } => {
+            store.mark_run_failed(run_id, reason)?;
+            Err(error)
         }
+    }
+}
+
+fn run_turn_response(
+    run_id: &RunId,
+    turn_base: RunTurnBase,
+    committed_turn: CommittedRunTurn,
+) -> RunTurnOnceResp {
+    RunTurnOnceResp {
+        runtime_policy: RUNTIME_RESUME_POLICY,
+        run_id: run_id.to_string(),
+        work_id: turn_base.work_id,
+        agent_id: turn_base.agent_id,
+        pending_wake_count: turn_base.pending_wake_count,
+        resumed: committed_turn.resume.resumed,
+        repair_count: committed_turn.resume.repair_count,
+        session_reset_reason: committed_turn.resume.session_reset_reason,
+        runtime_session_id: committed_turn.resume.runtime_session_id,
+        intent_kind: committed_turn.resume.intent_kind,
+        changed_file_count: committed_turn.evidence.changed_files.len(),
+        command_result_count: committed_turn.evidence.command_results.len(),
+        observed_agent_status: committed_turn.evidence.observed_agent_status,
     }
 }
 

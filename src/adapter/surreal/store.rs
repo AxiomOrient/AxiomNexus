@@ -458,7 +458,12 @@ impl SurrealStore {
             &lease_record_id(prepared.lease.lease_id.as_str()),
             LeaseDoc::from_model(&prepared.lease),
         )?;
-        let record = claim_transition_record(&snapshot, &prepared.lease, acquired_at_secs)?;
+        let work_snapshot = snapshot.clone().into_snapshot()?;
+        let record = crate::kernel::claim_transition_record(
+            &work_snapshot,
+            &prepared.lease,
+            timestamp(acquired_at_secs),
+        );
         self.upsert_record(
             &work_record_id(req.work_id.as_str()),
             WorkDoc {
@@ -3176,47 +3181,6 @@ fn prepare_runnable_run_for_claim(
     };
     let run_activity = Some(ActivityEventDoc::from_run(&run));
     Ok((run, run_activity))
-}
-
-fn claim_transition_record(
-    snapshot: &WorkDoc,
-    lease: &WorkLease,
-    happened_at_secs: u64,
-) -> Result<TransitionRecord, StoreError> {
-    Ok(TransitionRecord {
-        record_id: crate::model::RecordId::from(format!(
-            "record-{}-{}-Claim",
-            snapshot.work_id,
-            snapshot.rev + 1
-        )),
-        company_id: CompanyId::from(snapshot.company_id.clone()),
-        work_id: WorkId::from(snapshot.work_id.clone()),
-        actor_kind: ActorKind::Agent,
-        actor_id: crate::model::ActorId::from(lease.agent_id.as_str()),
-        run_id: lease.run_id.clone(),
-        session_id: None,
-        lease_id: Some(lease.lease_id.clone()),
-        expected_rev: snapshot.rev,
-        contract_set_id: ContractSetId::from(snapshot.contract_set_id.clone()),
-        contract_rev: snapshot.contract_rev,
-        before_status: parse_work_status(&snapshot.status)?,
-        after_status: Some(WorkStatus::Doing),
-        outcome: DecisionOutcome::Accepted,
-        reasons: Vec::new(),
-        kind: TransitionKind::Claim,
-        patch: crate::model::WorkPatch::default(),
-        gate_results: Vec::new(),
-        evidence: crate::model::EvidenceBundle {
-            observed_agent_status: Some(AgentStatus::Active),
-            observed_agent_company_id: Some(CompanyId::from(snapshot.company_id.clone())),
-            ..crate::model::EvidenceBundle::default()
-        },
-        evidence_inline: Some(crate::model::EvidenceInline {
-            summary: "Claim Accepted with next status Doing".to_owned(),
-        }),
-        evidence_refs: Vec::new(),
-        happened_at: timestamp(happened_at_secs),
-    })
 }
 
 fn claim_actor_agent_id(

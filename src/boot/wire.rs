@@ -323,8 +323,9 @@ fn replay_store(store: &impl ReplayStorePort) -> Result<ReplaySummary, BootError
 
     for snapshot in &snapshots {
         let records = store.load_transition_records(&snapshot.work_id)?;
+        let replay_base = crate::kernel::replay_base_snapshot(snapshot);
         if records.is_empty() {
-            if crate::kernel::replay_base_snapshot(snapshot) == *snapshot {
+            if replay_base == *snapshot {
                 verified_work_count += 1;
             } else {
                 skipped_work_count += 1;
@@ -332,11 +333,16 @@ fn replay_store(store: &impl ReplayStorePort) -> Result<ReplaySummary, BootError
             continue;
         }
 
-        let replayed = crate::kernel::replay_snapshot_from_records(
-            &crate::kernel::replay_base_snapshot(snapshot),
-            &records,
-        )
-        .map_err(|error| replay_failure(&snapshot.work_id, error))?;
+        if records
+            .first()
+            .is_some_and(|record| record.expected_rev != replay_base.rev)
+        {
+            skipped_work_count += 1;
+            continue;
+        }
+
+        let replayed = crate::kernel::replay_snapshot_from_records(&replay_base, &records)
+            .map_err(|error| replay_failure(&snapshot.work_id, error))?;
         if replayed != *snapshot {
             return Err(replay_failure(
                 &snapshot.work_id,
@@ -712,6 +718,54 @@ mod tests {
         };
 
         let summary = replay_store(&store).expect("recordless non-initial work should be skipped");
+
+        assert_eq!(summary.total_work_count, 1);
+        assert_eq!(summary.verified_work_count, 0);
+        assert_eq!(summary.skipped_work_count, 1);
+        assert_eq!(summary.replayed_record_count, 0);
+    }
+
+    #[test]
+    fn replay_store_skips_partial_history_record_stream() {
+        let work_id = WorkId::from("work-3");
+        let snapshot = WorkSnapshot {
+            status: WorkStatus::Todo,
+            rev: 2,
+            updated_at: SystemTime::UNIX_EPOCH + Duration::from_secs(2),
+            ..base_snapshot(&work_id)
+        };
+        let store = FakeReplayStore {
+            snapshots: vec![snapshot],
+            records: BTreeMap::from([(
+                work_id.to_string(),
+                vec![TransitionRecord {
+                    record_id: RecordId::from("record-partial"),
+                    company_id: crate::model::CompanyId::from("company-1"),
+                    work_id,
+                    actor_kind: ActorKind::System,
+                    actor_id: ActorId::from("system"),
+                    run_id: Some(crate::model::RunId::from("run-1")),
+                    session_id: None,
+                    lease_id: None,
+                    expected_rev: 1,
+                    contract_set_id: ContractSetId::from("contract-1"),
+                    contract_rev: 1,
+                    before_status: WorkStatus::Doing,
+                    after_status: Some(WorkStatus::Todo),
+                    outcome: DecisionOutcome::Accepted,
+                    reasons: Vec::new(),
+                    kind: TransitionKind::TimeoutRequeue,
+                    patch: WorkPatch::default(),
+                    gate_results: Vec::new(),
+                    evidence: crate::model::EvidenceBundle::default(),
+                    evidence_inline: None,
+                    evidence_refs: Vec::new(),
+                    happened_at: SystemTime::UNIX_EPOCH + Duration::from_secs(2),
+                }],
+            )]),
+        };
+
+        let summary = replay_store(&store).expect("partial history should be skipped");
 
         assert_eq!(summary.total_work_count, 1);
         assert_eq!(summary.verified_work_count, 0);

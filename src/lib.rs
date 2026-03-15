@@ -139,13 +139,11 @@ mod tests {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let required_docs = [
             "docs/00-index.md",
-            "docs/00-DESIGN-REVIEW.md",
             "docs/01-FINAL-TARGET.md",
             "docs/02-BLUEPRINT.md",
             "docs/03-DOMAIN-AND-INVARIANTS.md",
             "docs/04-API-SURFACE.md",
             "docs/05-QUALITY-GATES.md",
-            "docs/REFERENCES.md",
             "docs/spec/STOREPORT-SEMANTIC-CONTRACT.md",
             "docs/spec/RUNTIMEPORT-EXECUTE-TURN-SPEC.md",
             "docs/spec/CONFORMANCE-SUITE.md",
@@ -160,7 +158,6 @@ mod tests {
         let index =
             fs::read_to_string(repo_root.join("docs/00-index.md")).expect("docs index should load");
         for path in [
-            "00-DESIGN-REVIEW.md",
             "01-FINAL-TARGET.md",
             "02-BLUEPRINT.md",
             "03-DOMAIN-AND-INVARIANTS.md",
@@ -168,6 +165,7 @@ mod tests {
             "05-QUALITY-GATES.md",
             "spec/STOREPORT-SEMANTIC-CONTRACT.md",
             "spec/RUNTIMEPORT-EXECUTE-TURN-SPEC.md",
+            "spec/CONFORMANCE-SUITE.md",
         ] {
             assert!(
                 index.contains(path),

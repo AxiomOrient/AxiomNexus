@@ -1182,11 +1182,13 @@ mod tests {
             "axiomnexus-scripted-runtime-{}.json",
             std::process::id()
         ));
+        let raw_output = valid_output("propose_progress", None, true);
+        let intent = serde_json::from_str::<serde_json::Value>(&raw_output)
+            .expect("valid output should parse");
         let reply = serde_json::json!([{
             "handle": { "runtime_session_id": "scripted-test" },
-            "raw_output": valid_output("propose_progress", None, true),
-            "intent": serde_json::from_str::<serde_json::Value>(&valid_output("propose_progress", None, true))
-                .expect("valid output should parse"),
+            "raw_output": raw_output,
+            "intent": intent,
             "usage": {
                 "input_tokens": 1,
                 "output_tokens": 1,

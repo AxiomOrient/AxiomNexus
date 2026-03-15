@@ -1,6 +1,6 @@
 # AxiomNexus
 
-계약 우선 방식으로 에이전트 작업을 통제하는 Rust 기반 IDC control plane입니다.
+AxiomNexus는 AI 소프트웨어 팀의 업무를 작업 단위로 운영하고, 각 상태 전이를 계약과 증거로 판정하고 기록하는 control plane입니다.
 
 언어 포털: [KO](i18n/ko/README.md) | [ES](i18n/es/README.md) | [ZH](i18n/zh/README.md)
 
@@ -24,6 +24,13 @@ TransitionIntent  →  kernel decides  →  store commits
 - `triad`는 repo 내부 crate가 아니라 **외부 governance engine**으로 취급합니다.
 - repo 안에 `axiomnexus-governance` workspace, `triad.toml`, repo-local claim pack, `.triad/*` bootstrap 자산은 두지 않습니다.
 - 리뉴얼 기준은 호환 계층 유지보다 runtime 폐루프와 authoritative data contract를 먼저 닫는 것입니다.
+
+## 하지 않는 것
+
+- goals / budgets / org chart까지 넓히는 회사 운영 OS를 만들지 않습니다.
+- 여러 runtime을 한 번에 일반화하지 않습니다.
+- repo 안에 triad를 직접 넣어 함께 굴리지 않습니다.
+- 범용 workflow builder나 plugin system을 이번 버전에 넣지 않습니다.
 
 ## 빠른 시작
 
@@ -50,6 +57,19 @@ scripts/verify-release.sh   # ship-now release gate
 
 - `scheduler once`: 운영자가 queued run을 하나 소비시키는 canonical operator path
 - `run once <run_id>`: 특정 queued run을 직접 재현하는 deterministic diagnostic path
+
+## Preview workflow
+
+내부 preview 운영은 아래 한 흐름으로 이해하면 된다.
+
+1. `cargo run -- serve`로 API를 연다.
+2. company, contract, agent, work를 만든다.
+3. work를 `queue` 한다.
+4. 운영자는 `cargo run -- scheduler once`로 queued run 하나를 소비시킨다.
+5. `GET /api/activity`, `GET /api/runs/{id}`, `GET /api/work/{id}`로 결과를 확인한다.
+6. `cargo run -- replay`로 현재 상태와 ledger가 맞는지 다시 검증한다.
+
+문제가 있는 특정 queued run만 다시 볼 때는 `cargo run -- run once <run_id>`를 쓴다.
 
 scripted smoke는 `scripts/smoke-runtime.sh` 내부에서만 아래 조합을 임시로 사용한다.
 
@@ -118,13 +138,16 @@ scripts/verify-release.sh
 
 ## 문서
 
+- 실사용 흐름은 이 README의 `Preview workflow`를 먼저 본다.
 - [문서 인덱스](docs/00-index.md) — canonical 읽기 순서
 - [최종 도착지](docs/01-FINAL-TARGET.md) — 범위와 완료 조건
 - [청사진](docs/02-BLUEPRINT.md) — 구조와 제어 흐름
 - [도메인 모델과 불변식](docs/03-DOMAIN-AND-INVARIANTS.md) — 핵심 모델 기준
+- [운영 표면](docs/04-API-SURFACE.md) — CLI / HTTP / SSE 기준
+- [품질 게이트](docs/05-QUALITY-GATES.md) — 개발 / 릴리스 검증 순서
 - [저장소 계약](docs/spec/STOREPORT-SEMANTIC-CONTRACT.md) — store 의미론 기준
-- [릴리스 체크리스트](RELEASE-CHECKLIST.md) — ship-now release 절차
-- [릴리스 노트 템플릿](docs/RELEASE-NOTES-TEMPLATE.md) — 배포 기록 형식
+- [runtime 계약](docs/spec/RUNTIMEPORT-EXECUTE-TURN-SPEC.md) — execute-turn 기준
+- [adapter 검증 목록](docs/spec/CONFORMANCE-SUITE.md) — store 의미 검증 목록
 
 ## 현재 제한
 

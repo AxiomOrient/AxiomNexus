@@ -4,6 +4,7 @@ mod apply;
 mod claim;
 mod decide;
 mod reaper;
+mod record;
 mod replay;
 mod session;
 mod wake;
@@ -40,6 +41,25 @@ pub(crate) fn command_gate_specs(
 
 pub(crate) fn claim_lease(snapshot: &WorkSnapshot) -> Result<(), ReasonCode> {
     claim::claim_lease(snapshot)
+}
+
+pub(crate) fn claim_transition_record(
+    snapshot: &WorkSnapshot,
+    lease: &WorkLease,
+    happened_at: SystemTime,
+) -> crate::model::TransitionRecord {
+    claim::claim_transition_record(snapshot, lease, happened_at)
+}
+
+pub(crate) fn transition_record(
+    snapshot: &WorkSnapshot,
+    lease: Option<&WorkLease>,
+    intent: &TransitionIntent,
+    decision: &TransitionDecision,
+    session_id: Option<&crate::model::SessionId>,
+    happened_at: SystemTime,
+) -> crate::model::TransitionRecord {
+    record::transition_record(snapshot, lease, intent, decision, session_id, happened_at)
 }
 
 pub(crate) fn apply_snapshot_patch(
@@ -81,6 +101,15 @@ pub(crate) fn advance_session(
     invalidation_reason: Option<SessionInvalidationReason>,
 ) -> TaskSession {
     session::advance_session(existing, candidate, invalidation_reason)
+}
+
+pub(crate) fn next_session_from_decision(
+    existing: Option<TaskSession>,
+    contract_rev: u32,
+    record: &crate::model::TransitionRecord,
+    decision: &TransitionDecision,
+) -> Option<TaskSession> {
+    record::next_session_from_decision(existing, contract_rev, record, decision)
 }
 
 pub(crate) fn session_invalidation_reason(

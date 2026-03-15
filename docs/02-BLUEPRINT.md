@@ -1,23 +1,9 @@
 # 청사진
 
-## 정적 구조
-
-```mermaid
-flowchart LR
-  main[boot] --> app
-  app --> kernel
-  kernel --> model
-  app --> port
-  adapter --> port
-  boot --> adapter
-```
-
-상위 모듈은 아래 여섯 개만 둔다. [R2]
+## 상위 구조
 
 ```text
 src/
-  lib.rs
-  main.rs
   boot/
   model/
   kernel/
@@ -26,168 +12,73 @@ src/
   adapter/
 ```
 
----
-
-## 책임 분해
+## 각 경계의 책임
 
 ### `model`
-canonical data contract만 둔다. [R2][R3][R7][R8][R9]
-
-- ids / enums / structs
-- schema derive
-- 얕은 invariant constructor
-
-금지:
-- DB I/O
-- runtime 호출
-- async
-- process spawn
+- 타입과 데이터 계약만 둔다
+- 외부 I/O를 두지 않는다
 
 ### `kernel`
-pure decision rules만 둔다. [R2]
-
-- claim rules
-- wake merge
-- session advance
-- decision evaluation
-- snapshot patch
-
-금지:
-- trait object
-- DB / file / process I/O
+- 상태 전이 규칙과 순수 계산만 둔다
+- 저장, 파일, 프로세스 실행을 두지 않는다
 
 ### `app`
-use-case orchestration만 둔다. [R2][R3]
-
-- context load
-- execute_turn orchestration
-- evidence assembly
-- kernel 호출
-- store commit
+- use-case 흐름을 조립한다
+- context load, evidence assembly, kernel 호출, commit 호출을 맡는다
 
 ### `port`
-외부 경계 trait만 둔다.
-
-- `StorePort`
-- `RuntimePort`
-- `ClockPort`
-- `BlobPort` (optional)
+- 외부 경계 trait만 둔다
 
 ### `adapter`
-실제 구현만 둔다.
-
-- `adapter::surreal`
-- `adapter::postgres` *(later)*
-- `adapter::coclai`
-- `adapter::http`
-- `adapter::sse`
-- `adapter::clock`
-- `adapter::fs`
+- store, runtime, HTTP, SSE 구현만 둔다
 
 ### `boot`
-config / wiring / CLI entrypoint만 둔다.
+- 설정, wiring, CLI 진입점만 둔다
 
----
+## 허용 방향
 
-## 최종 control flow
-
-```mermaid
-sequenceDiagram
-  participant O as operator/scheduler
-  participant A as app
-  participant S as store
-  participant R as runtime
-  participant K as kernel
-
-  O->>A: queue / wake / execute
-  A->>S: load_context / claim_lease / load_session
-  A->>R: execute_turn(input)
-  R-->>A: intent + observations
-  A->>K: decide_transition(snapshot, lease, contract, evidence, intent)
-  K-->>A: TransitionDecision
-  A->>S: commit_decision(record, effects)
-  S-->>A: snapshot/lease/session/pending_wake updated
+```text
+boot -> app -> kernel -> model
+app  -> port
+adapter -> port
+adapter -> model
+boot -> adapter
 ```
 
-핵심은 다음 두 문장이다.
+## 금지 방향
 
-1. runtime은 **intent와 observations**를 반환한다. [R4]
-2. 최종 판정은 kernel이 하고, 최종 반영은 store가 한다. [R1][R2]
+- `kernel -> app`
+- `kernel -> adapter`
+- `model -> adapter`
 
----
+## 핵심 쓰기 경로
 
-## Runtime boundary 최종형
+```text
+load_context
+  -> collect evidence
+  -> kernel::decide_transition
+  -> store.commit_decision
+```
 
-현재 저장소는 `RuntimePort::execute_turn`을 가지고 있고, 이번 리팩터링에서 아래 local observation을 같은 turn contract로 수렴시킨다. [R4][R5]
+이 경로 밖에서 authoritative 상태를 바꾸지 않는다.
 
-- current_dir
-- observe_changed_files
-- run_gate_command
+## runtime turn 흐름
 
-지금 canonical 경계에서는 이 셋이 `execute_turn`의 `gate_plan` / `observations`로 흡수된다.
+```text
+load_runtime_turn
+  -> resume / execute runtime
+  -> collect observations
+  -> build evidence
+  -> decide
+  -> commit
+```
 
-### 이유
-- process / filesystem / cwd 관측은 모두 runtime turn의 일부다.
-- 별도 `WorkspacePort`를 두면 한 turn에서 수집된 증거가 경계 밖으로 찢어진다.
-- commit 직전까지 필요한 관측이 한 envelope로 닫히지 않는다.
+핵심은 runtime이 판정하지 않는다는 점이다.
+runtime은 관측을 반환하고, kernel이 그 관측을 해석한다.
 
-### 최종형 원칙
-- runtime은 local action + local observation을 모두 책임진다
-- kernel은 policy verdict만 책임진다
-- store는 authoritative commit만 책임진다
+## 문서 경계
 
----
-
-## Store boundary 최종형
-
-`StorePort`는 CRUD 모음이 아니라 **semantic operation contract**다. [R2][R6]
-
-핵심 연산은 아래 네 묶음으로 나뉜다.
-
-1. **control-plane mutation**
-   - `claim_lease`
-   - `load_context`
-   - `commit_decision`
-   - `merge_wake`
-
-2. **runtime support**
-   - `load_runtime_turn`
-   - `load_session`
-   - `save_session`
-   - `mark_run_running`
-   - `mark_run_completed`
-   - `mark_run_failed`
-   - `record_consumption`
-
-3. **replay / export**
-   - `list_work_snapshots`
-   - `load_transition_records`
-   - `export_state`
-   - `import_state`
-
-4. **query read-model**
-   - board / work / agent / run / activity
-
----
-
-## 최종 public surface
-
-현재 저장소는 CLI `migrate`, `doctor`, `contract check`, `serve`, `replay`, `export`, `import` 를 이미 명시한다. [R1]  
-최종형에서도 이 표면은 유지한다.
-
-자세한 API는 `04-API-SURFACE.md`를 본다.
-
----
-
-## 구현 전략 요약
-
-1. **port contraction 먼저**
-2. **IDC kernel freeze**
-3. **Surreal adapter closure**
-4. **runtime evidence closure**
-5. **API / replay / observability**
-6. **triad bridge**
-7. **PostgreSQL adapter later**
-
-이 순서가 가장 단순하다.  
-이 순서는 현재 저장소의 active docs와도 충돌하지 않는다. [R1][R2]
+- 구조는 이 문서에 둔다
+- 타입 규칙은 `03-DOMAIN-AND-INVARIANTS.md`에 둔다
+- 운영 표면은 `04-API-SURFACE.md`에 둔다
+- 저장 의미 규칙은 `spec/STOREPORT-SEMANTIC-CONTRACT.md`에 둔다

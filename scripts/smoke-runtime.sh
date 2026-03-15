@@ -204,7 +204,7 @@ printf '%s\n' "$contract_check_output" | grep -q "axiomnexus contract check live
 echo "[4/13] serve"
 start_server
 
-echo "[5/13] onboarding and queue"
+echo "[5/13] preview onboarding and queue"
 contracts_json="$(http_json GET /api/contracts/active)"
 rules_json="$(printf '%s' "$contracts_json" | json_get "data.rules")"
 
@@ -275,7 +275,7 @@ agents_json="$(http_json GET /api/agents)"
 run_id="$(printf '%s' "$agents_json" | queued_run_id_for_work "$work_id")"
 lease_id="$(lease_id_for_run "$run_id")"
 
-echo "[7/13] run once diagnostic accepted path"
+echo "[7/13] scheduler once canonical operator path"
 printf 'smoke proof\n' >"$ROOT_DIR/$PROOF_FILE"
 expected_rev="$((before_rev + 1))"
 before_board="$(http_json GET /api/board)"
@@ -293,10 +293,10 @@ write_replies \
   "runtime smoke follow up" \
   "0"
 stop_server
-scheduler_output="$(AXIOMNEXUS_ALLOW_SCRIPTED_RUNTIME=1 AXIOMNEXUS_COCLAI_SCRIPT_PATH="$REPLIES_PATH" run_cli cargo run --quiet -- run once "$run_id")"
-printf '%s\n' "$scheduler_output" | grep -q "axiomnexus run once live"
-printf '%s\n' "$scheduler_output" | grep -q "run_id=${run_id}"
-printf '%s\n' "$scheduler_output" | grep -q "repair_count=0"
+operator_output="$(AXIOMNEXUS_ALLOW_SCRIPTED_RUNTIME=1 AXIOMNEXUS_COCLAI_SCRIPT_PATH="$REPLIES_PATH" run_cli cargo run --quiet -- scheduler once)"
+printf '%s\n' "$operator_output" | grep -q "axiomnexus scheduler once live"
+printf '%s\n' "$operator_output" | grep -q "run_id=${run_id}"
+printf '%s\n' "$operator_output" | grep -q "repair_count=0"
 start_server
 
 echo "[8/13] direct transition record gate"
@@ -381,7 +381,7 @@ activity_json="$(http_json GET /api/activity)"
 printf '%s' "$activity_json" | grep -q '"event_kind":"transition"'
 printf '%s' "$activity_json" | grep -q '"summary":"Complete Accepted with next status Done"'
 
-echo "[10/13] invalid-session repair path"
+echo "[10/13] run once deterministic diagnostic path"
 reopen_body="$(python3 - <<'PY' "$work_id" "$agent_id" "$after_rev"
 import json, sys
 print(json.dumps({

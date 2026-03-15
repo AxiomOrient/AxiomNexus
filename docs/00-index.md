@@ -1,33 +1,45 @@
-# AxiomNexus 문서 인덱스
+# AxiomNexus 문서 맵
 
-canonical reader path는 두 곳으로 고정한다.
+문서 입구는 두 곳만 쓴다.
 
-1. root `README.md`
+1. `README.md`
 2. `docs/00-index.md`
 
-먼저 읽을 문서:
+가장 먼저 볼 운영 흐름은 `README.md`의 `Preview workflow`다.
 
-1. `00-DESIGN-REVIEW.md` — 왜 final package를 이렇게 정리했는지
-2. `01-FINAL-TARGET.md` — 최종 도착지와 범위
-3. `02-BLUEPRINT.md` — 정적 구조와 제어 흐름
-4. `03-DOMAIN-AND-INVARIANTS.md` — 핵심 모델과 불변식
-5. `04-API-SURFACE.md` — CLI / HTTP / SSE 표면
-6. `05-QUALITY-GATES.md` — 품질 게이트와 검증 전략
-7. `spec/STOREPORT-SEMANTIC-CONTRACT.md` — 저장소 의미론 기준 계약
-8. `spec/RUNTIMEPORT-EXECUTE-TURN-SPEC.md` — runtime turn 최종 계약
-9. `RELEASE-NOTES-TEMPLATE.md` — release note 기록 형식
+## 1. 제품 정의
 
-정리 원칙:
+1. `01-FINAL-TARGET.md`
+   현재 제품이 무엇인지, 무엇을 포함하고 무엇을 제외하는지 정리한다.
+2. `03-DOMAIN-AND-INVARIANTS.md`
+   핵심 데이터와 반드시 지켜야 할 규칙만 모아 둔다.
 
-- 새 독자 입구는 root `README.md`와 `docs/00-index.md`만 쓴다.
-- `docs/`는 제품/계약 문서 표면이다.
-- `docs/spec/`는 바뀌면 안 되는 계약 문서다.
-- `docs/adr/`는 구조 결정을 기록한다.
-- `README.md`, `docs/`, `samples/`는 같은 canonical 구조를 말해야 한다.
+## 2. 구조와 표면
 
-역사 참고 문서:
+3. `02-BLUEPRINT.md`
+   코드 경계, 의존 방향, 쓰기 경로를 설명한다.
+4. `04-API-SURFACE.md`
+   CLI, HTTP, SSE의 살아 있는 운영 표면만 정리한다.
 
-- `01-system-design.md` — 초기 제품 경계 요약. 현재 canonical entry는 아님
-- `05-target-architecture.md` — 초기 목표 구조 요약. 현재 canonical entry는 아님
+## 3. 계약 문서
 
-이 두 문서는 삭제 대상은 아니지만, 새 작업의 시작점으로 쓰지 않는다.
+5. `spec/STOREPORT-SEMANTIC-CONTRACT.md`
+   저장소 의미 규칙의 기준 문서다.
+6. `spec/RUNTIMEPORT-EXECUTE-TURN-SPEC.md`
+   runtime turn 입력과 출력 계약의 기준 문서다.
+7. `spec/CONFORMANCE-SUITE.md`
+   저장소 adapter가 같은 의미를 지키는지 검증하는 목록이다.
+
+## 4. 운영과 변경 이력
+
+8. `05-QUALITY-GATES.md`
+   개발, 릴리스, 회귀 검증 순서를 정리한다.
+9. `adr/`
+   이미 확정된 구조 결정을 짧게 기록한다.
+
+## 문서 원칙
+
+- 문서는 한 주제당 한 파일만 기준으로 둔다.
+- 역사 설명은 별도 참고 문서로 늘리지 않는다.
+- 현재 제품 표면과 직접 연결되지 않는 초안, 회고, 중복 설명은 남기지 않는다.
+- `README.md`, `docs/`, `samples/`는 같은 구조를 말해야 한다.

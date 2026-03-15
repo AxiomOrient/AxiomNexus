@@ -5,12 +5,11 @@ use std::time::Duration;
 use crate::{
     kernel,
     model::{
-        ActorId, ActorKind, DecisionOutcome, EvidenceBundle, EvidenceInline, RecordId, TaskSession,
-        TransitionIntent, TransitionRecord,
+        AgentStatus, CompanyId, DecisionOutcome, EvidenceBundle, TaskSession, TransitionIntent,
     },
     port::{
         runtime::RuntimeObservations,
-        store::{CommandStorePort, CommitDecisionReq, SessionKey, StoreError},
+        store::{CommandStorePort, CommitDecisionReq, CommitDecisionRes, SessionKey, StoreError},
     },
 };
 
@@ -30,6 +29,18 @@ pub(crate) struct SubmitIntentAck {
     pub(crate) after_commit_event_data: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObservedAgentFacts {
+    status: Option<AgentStatus>,
+    company_id: Option<CompanyId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DecisionCommitPlan {
+    decision: crate::model::TransitionDecision,
+    request: CommitDecisionReq,
+}
+
 pub(crate) fn handle_submit_intent(
     store: &impl CommandStorePort,
     cmd: SubmitIntentCmd,
@@ -43,12 +54,7 @@ pub(crate) fn collect_direct_submit_evidence(
     store: &impl CommandStorePort,
     intent: &TransitionIntent,
 ) -> Result<EvidenceBundle, StoreError> {
-    let (observed_agent_status, observed_agent_company_id) = observed_agent_facts(store, intent)?;
-    Ok(EvidenceBundle {
-        observed_agent_status,
-        observed_agent_company_id,
-        ..EvidenceBundle::default()
-    })
+    Ok(observed_agent_facts(store, intent)?.into_evidence_bundle(None))
 }
 
 pub(crate) fn collect_runtime_observation_evidence(
@@ -56,15 +62,7 @@ pub(crate) fn collect_runtime_observation_evidence(
     observations: &RuntimeObservations,
     intent: &TransitionIntent,
 ) -> Result<EvidenceBundle, StoreError> {
-    let (observed_agent_status, observed_agent_company_id) = observed_agent_facts(store, intent)?;
-    Ok(EvidenceBundle {
-        changed_files: observations.changed_files.clone(),
-        command_results: observations.command_results.clone(),
-        artifact_refs: observations.artifact_refs.clone(),
-        observed_agent_status,
-        observed_agent_company_id,
-        ..EvidenceBundle::default()
-    })
+    Ok(observed_agent_facts(store, intent)?.into_evidence_bundle(Some(observations)))
 }
 
 pub(crate) fn commit_runtime_intent(
@@ -78,6 +76,29 @@ pub(crate) fn commit_runtime_intent(
         work_id: intent.work_id.clone(),
     };
     let existing_session = store.load_session(&session_key)?;
+    let commit_plan = decision_commit_plan(context, intent, evidence, existing_session);
+    let committed = store.commit_decision(commit_plan.request)?;
+
+    Ok(submit_intent_ack(&commit_plan.decision, committed))
+}
+
+fn observed_agent_facts(
+    store: &impl CommandStorePort,
+    intent: &TransitionIntent,
+) -> Result<ObservedAgentFacts, StoreError> {
+    let agent = store.load_agent_facts(&intent.agent_id)?;
+    Ok(ObservedAgentFacts {
+        status: agent.as_ref().map(|agent| agent.status),
+        company_id: agent.map(|agent| agent.company_id),
+    })
+}
+
+fn decision_commit_plan(
+    context: &crate::port::store::WorkContext,
+    intent: &TransitionIntent,
+    evidence: EvidenceBundle,
+    existing_session: Option<TaskSession>,
+) -> DecisionCommitPlan {
     let decision = kernel::decide_transition(
         &context.snapshot,
         context.lease.as_ref(),
@@ -86,131 +107,57 @@ pub(crate) fn commit_runtime_intent(
         &evidence,
         intent,
     );
-    let record = record_from_decision(context, intent, &decision, existing_session.as_ref());
-    let session = session_from_decision(existing_session, &context.contract, &record, &decision);
-    let committed =
-        store.commit_decision(CommitDecisionReq::new(decision.clone(), record, session))?;
+    let record = kernel::transition_record(
+        &context.snapshot,
+        context.lease.as_ref(),
+        intent,
+        &decision,
+        existing_session.as_ref().map(|session| &session.session_id),
+        context.snapshot.updated_at + Duration::from_secs(1),
+    );
+    let session = kernel::next_session_from_decision(
+        existing_session,
+        context.contract.revision,
+        &record,
+        &decision,
+    );
 
-    Ok(SubmitIntentAck {
+    DecisionCommitPlan {
+        request: CommitDecisionReq::new(decision.clone(), record, session),
+        decision,
+    }
+}
+
+fn submit_intent_ack(
+    decision: &crate::model::TransitionDecision,
+    committed: CommitDecisionRes,
+) -> SubmitIntentAck {
+    SubmitIntentAck {
         decision_path: DECISION_PATH,
         outcome: decision.outcome,
-        summary: decision.summary,
+        summary: decision.summary.clone(),
         after_commit_event_data: serde_json::to_string(
             &committed
                 .activity_event
                 .expect("commit_decision should persist an activity event"),
         )
         .expect("activity event json should serialize"),
-    })
-}
-
-pub(crate) fn observed_agent_facts(
-    store: &impl CommandStorePort,
-    intent: &TransitionIntent,
-) -> Result<
-    (
-        Option<crate::model::AgentStatus>,
-        Option<crate::model::CompanyId>,
-    ),
-    StoreError,
-> {
-    let agent = store.load_agent_facts(&intent.agent_id)?;
-    Ok((
-        agent.as_ref().map(|agent| agent.status),
-        agent.map(|agent| agent.company_id),
-    ))
-}
-
-fn record_from_decision(
-    context: &crate::port::store::WorkContext,
-    intent: &TransitionIntent,
-    decision: &crate::model::TransitionDecision,
-    existing_session: Option<&TaskSession>,
-) -> TransitionRecord {
-    TransitionRecord {
-        record_id: RecordId::from(format!(
-            "record-{}-{}-{:?}",
-            context.snapshot.work_id,
-            context.snapshot.rev + 1,
-            intent.kind
-        )),
-        company_id: context.snapshot.company_id.clone(),
-        work_id: intent.work_id.clone(),
-        actor_kind: actor_kind_for(intent.kind),
-        actor_id: actor_id_for(intent.kind, intent),
-        run_id: context
-            .lease
-            .as_ref()
-            .and_then(|lease| lease.run_id.clone()),
-        session_id: existing_session.map(|session| session.session_id.clone()),
-        lease_id: context.lease.as_ref().map(|lease| lease.lease_id.clone()),
-        expected_rev: intent.expected_rev,
-        contract_set_id: context.snapshot.contract_set_id.clone(),
-        contract_rev: context.snapshot.contract_rev,
-        before_status: context.snapshot.status,
-        after_status: decision
-            .next_snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.status),
-        outcome: decision.outcome,
-        reasons: decision.reasons.clone(),
-        kind: intent.kind,
-        patch: intent.patch.clone(),
-        gate_results: decision.gate_results.clone(),
-        evidence: decision.evidence.clone(),
-        evidence_inline: Some(EvidenceInline {
-            summary: decision.summary.clone(),
-        }),
-        evidence_refs: decision.evidence.artifact_refs.clone(),
-        happened_at: context.snapshot.updated_at + Duration::from_secs(1),
     }
 }
 
-fn session_from_decision(
-    existing: Option<TaskSession>,
-    contract: &crate::model::ContractSet,
-    record: &TransitionRecord,
-    decision: &crate::model::TransitionDecision,
-) -> Option<TaskSession> {
-    let existing = existing?;
-
-    let mut candidate = existing.clone();
-    candidate.contract_rev = contract.revision;
-    candidate.last_record_id = Some(record.record_id.clone());
-    candidate.updated_at = record.happened_at;
-
-    match decision.outcome {
-        DecisionOutcome::Accepted | DecisionOutcome::OverrideAccepted => {
-            candidate.last_decision_summary = Some(decision.summary.clone());
-            candidate.last_gate_summary = None;
+impl ObservedAgentFacts {
+    fn into_evidence_bundle(self, observations: Option<&RuntimeObservations>) -> EvidenceBundle {
+        let mut evidence = EvidenceBundle::default();
+        if let Some(observations) = observations {
+            evidence.changed_files = observations.changed_files.clone();
+            evidence.command_results = observations.command_results.clone();
+            evidence.artifact_refs = observations.artifact_refs.clone();
         }
-        DecisionOutcome::Rejected | DecisionOutcome::Conflict => {
-            candidate.last_gate_summary = Some(decision.summary.clone());
+        EvidenceBundle {
+            observed_agent_status: self.status,
+            observed_agent_company_id: self.company_id,
+            ..evidence
         }
-    }
-
-    Some(kernel::advance_session(Some(&existing), candidate, None))
-}
-
-fn actor_kind_for(kind: crate::model::TransitionKind) -> ActorKind {
-    match kind {
-        crate::model::TransitionKind::Queue
-        | crate::model::TransitionKind::Reopen
-        | crate::model::TransitionKind::Cancel
-        | crate::model::TransitionKind::OverrideComplete => ActorKind::Board,
-        crate::model::TransitionKind::TimeoutRequeue => ActorKind::System,
-        crate::model::TransitionKind::Claim
-        | crate::model::TransitionKind::ProposeProgress
-        | crate::model::TransitionKind::Complete
-        | crate::model::TransitionKind::Block => ActorKind::Agent,
-    }
-}
-
-fn actor_id_for(kind: crate::model::TransitionKind, intent: &TransitionIntent) -> ActorId {
-    match actor_kind_for(kind) {
-        ActorKind::Agent => ActorId::from(intent.agent_id.as_str()),
-        ActorKind::Board => ActorId::from("board"),
-        ActorKind::System => ActorId::from("system"),
     }
 }
 
