@@ -27,10 +27,9 @@ RELEASE_NOTES_PATH="$EVIDENCE_DIR/release-notes.md"
 mkdir -p "$EVIDENCE_DIR"
 
 export AXIOMNEXUS_RELEASE_EVIDENCE_DIR="$EVIDENCE_DIR"
+export AXIOMNEXUS_RELEASE_VERSION="$VERSION"
 
-scripts/verify-release.sh | tee "$VERIFY_LOG"
-cargo run --quiet -- replay | tee "$REPLAY_LOG"
-AXIOMNEXUS_EXPORT_PATH="$SNAPSHOT_PATH" cargo run --quiet -- export >/dev/null
+scripts/verify-release.sh
 
 cat >"$RELEASE_NOTES_PATH" <<EOF
 # Release Notes

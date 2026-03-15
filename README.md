@@ -1,6 +1,6 @@
 # AxiomNexus
 
-AxiomNexus는 AI 소프트웨어 팀의 업무를 작업 단위로 운영하고, 각 상태 전이를 계약과 증거로 판정하고 기록하는 control plane입니다.
+AxiomNexus는 AI 소프트웨어 팀의 work/run 상태를 운영하고, 각 상태 전이를 계약과 증거로 판정하고 기록하는 control plane입니다. 회사 운영 OS를 넓게 만들려는 저장소가 아니고, 단순 코드 변경 승인기만으로도 축소하지 않습니다.
 
 언어 포털: [KO](i18n/ko/README.md) | [ES](i18n/es/README.md) | [ZH](i18n/zh/README.md)
 
@@ -27,7 +27,9 @@ TransitionIntent  →  kernel decides  →  store commits
 
 ## 하지 않는 것
 
-- goals / budgets / org chart까지 넓히는 회사 운영 OS를 만들지 않습니다.
+- 회사 운영 OS로 범위를 넓히지 않습니다.
+- PostgreSQL adapter를 이번 버전에 시작하지 않습니다.
+- goals / budgets / org chart 같은 broad company surface를 이번 버전에 넣지 않습니다.
 - 여러 runtime을 한 번에 일반화하지 않습니다.
 - repo 안에 triad를 직접 넣어 함께 굴리지 않습니다.
 - 범용 workflow builder나 plugin system을 이번 버전에 넣지 않습니다.
@@ -50,13 +52,14 @@ cargo run -- contract check # 활성 계약 검증
 cargo run -- serve          # HTTP 서버 시작 (기본: 127.0.0.1:3000)
 cargo run -- scheduler once # 운영용 canonical queue consumer
 cargo run -- run once run-2 # 특정 queued run을 직접 태우는 diagnostic path
-scripts/verify-release.sh   # ship-now release gate
+scripts/verify-release.sh   # ship-now release gate + evidence pack export
 ```
 
 빠른 시작에서 command 역할은 아래처럼 고정한다.
 
 - `scheduler once`: 운영자가 queued run을 하나 소비시키는 canonical operator path
 - `run once <run_id>`: 특정 queued run을 직접 재현하는 deterministic diagnostic path
+- `scripts/verify-release.sh`: `.axiomnexus/releases/<version>/` 아래에 verify/smoke/replay/snapshot evidence를 남기는 release gate
 
 ## Preview workflow
 
@@ -90,6 +93,11 @@ AXIOMNEXUS_HTTP_ADDR=127.0.0.1:3001 cargo run -- serve
 - 자동 실행 경로의 기준 use-case는 `run_turn_once`입니다.
 - authoritative write path는 `Intent -> Decide -> Commit` 하나뿐입니다.
 - replay는 `TransitionRecord`를 기준으로 snapshot 정합성을 검증하는 운영 도구여야 합니다.
+
+## Preview evidence fields
+
+- `artifact_refs`는 runtime이 파일, 로그, 외부 산출물 경로를 실제로 남길 때만 채워도 됩니다. preview smoke에서는 비어 있어도 실패가 아닙니다.
+- `notes`는 operator에게 남길 짧은 관측 메모가 있을 때만 채웁니다. 값이 없으면 `null`이어도 됩니다.
 
 ## 저장소 상태
 

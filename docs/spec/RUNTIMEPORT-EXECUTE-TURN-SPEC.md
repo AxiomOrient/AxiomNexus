@@ -74,6 +74,11 @@ pub(crate) struct GateCommandSpec {
 - changed files
 - command results
 - artifact refs
+- notes
+
+preview 기준:
+- `artifact_refs`는 runtime이 실제 산출물 경로를 잡았을 때만 채운다. 비어 있으면 “산출물 없음”으로 해석한다.
+- `notes`는 operator에게 남길 추가 관측이 있을 때만 채운다. 없으면 `null` 허용이다.
 
 ## canonical schema
 

@@ -14,6 +14,14 @@ if [[ -n "${AXIOMNEXUS_SMOKE_LOG_PATH:-}" ]]; then
   exec > >(tee "$AXIOMNEXUS_SMOKE_LOG_PATH") 2>&1
 fi
 
+if [[ -n "${AXIOMNEXUS_REPLAY_LOG_PATH:-}" ]]; then
+  mkdir -p "$(dirname "$AXIOMNEXUS_REPLAY_LOG_PATH")"
+fi
+
+if [[ -n "${AXIOMNEXUS_SMOKE_EXPORT_PATH:-}" ]]; then
+  mkdir -p "$(dirname "$AXIOMNEXUS_SMOKE_EXPORT_PATH")"
+fi
+
 cleanup() {
   stop_server
   rm -f "$ROOT_DIR/$PROOF_FILE"
@@ -462,6 +470,16 @@ printf '%s' "$bad_response" | grep -q '"error"\|"outcome":"rejected"\|"outcome":
 echo "[12/13] replay integrity proxy gate"
 stop_server
 replay_output="$(run_cli cargo run --quiet -- replay)"
+if [[ -n "${AXIOMNEXUS_REPLAY_LOG_PATH:-}" ]]; then
+  printf '%s\n' "$replay_output" >"$AXIOMNEXUS_REPLAY_LOG_PATH"
+fi
 printf '%s\n' "$replay_output" | grep -q "decision_path=transition_record"
+
+if [[ -n "${AXIOMNEXUS_SMOKE_EXPORT_PATH:-}" ]]; then
+  AXIOMNEXUS_DATA_DIR="$DATA_DIR" \
+  AXIOMNEXUS_EXPORT_PATH="$AXIOMNEXUS_SMOKE_EXPORT_PATH" \
+    cargo run --quiet -- export >/dev/null
+  [[ -s "$AXIOMNEXUS_SMOKE_EXPORT_PATH" ]]
+fi
 
 echo "[13/13] smoke-runtime ok"
